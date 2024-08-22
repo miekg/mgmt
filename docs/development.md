@@ -31,6 +31,12 @@ required for running the _test_ suite.
 * `golang` 1.21 or higher (required, available in some distros and distributed
 as a binary officially by [golang.org](https://golang.org/dl/))
 
+* for the lex/yacc parser the following tools need to be install:
+
+    - `nex` (nex package on Ubuntu/Fedora)
+    - `ragel` (ragal package on Ubuntu/Fedora)
+    - `goyacc` (`go install golang.org/x/tools/cmd/goyacc`)
+
 ### Runtime
 
 A relatively modern GNU/Linux system should be able to run `mgmt` without any
