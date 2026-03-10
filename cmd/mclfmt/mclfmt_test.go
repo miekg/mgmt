@@ -42,6 +42,19 @@ func TestPrint(t *testing.T) {
 			$x1 = pkg.foo1(true, "hello")
 			`,
 		},
+		{
+			name: "edge stmt",
+			code: `
+			test "t1" {
+				int64ptr => 42,
+			}
+			test "t2" {
+				int64ptr => 13,
+			}
+
+			Test["t1"].foosend -> Test["t2"].barrecv
+			`,
+		},
 	}
 
 	for _, tc := range testcases {

@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/purpleidea/mgmt/lang/ast"
 	"github.com/purpleidea/mgmt/lang/funcs/operators"
@@ -16,6 +17,12 @@ func Print(a any, w *LineWriter, opt Option) {
 		StmtRes(a, w, opt)
 	case *ast.StmtBind:
 		StmtBind(a, w, opt)
+	case *ast.StmtResField:
+		StmtResField(a, w, opt)
+	case *ast.StmtEdge:
+		StmtEdge(a, w, opt)
+	case *ast.StmtEdgeHalf:
+		StmtEdgeHalf(a, w, opt)
 	case *ast.ExprStr:
 		ExprStr(a, w, opt)
 	case *ast.ExprInt:
@@ -24,8 +31,8 @@ func Print(a any, w *LineWriter, opt Option) {
 		ExprFloat(a, w, opt)
 	case *ast.ExprBool:
 		ExprBool(a, w, opt)
-	case *ast.StmtResField:
-		StmtResField(a, w, opt)
+	case *ast.ExprVar:
+		ExprVar(a, w, opt)
 	case *ast.ExprCall:
 		ExprCall(a, w, opt)
 	default:
@@ -40,12 +47,20 @@ func StmtProg(a *ast.StmtProg, w *LineWriter, opt Option) {
 }
 
 func StmtBind(a *ast.StmtBind, w *LineWriter, opt Option) {
-	fmt.Fprintf(w, " $%s =", a.Ident)
+	if opt.DropSpace {
+		fmt.Fprintf(w, "$%s =", a.Ident)
+	} else {
+		fmt.Fprintf(w, " $%s =", a.Ident)
+	}
 	Print(a.Value, w, opt)
 }
 
 func StmtRes(a *ast.StmtRes, w *LineWriter, opt Option) {
-	fmt.Fprintf(w, " %s", a.Kind)
+	if opt.DropSpace {
+		fmt.Fprintf(w, "%s", a.Kind)
+	} else {
+		fmt.Fprintf(w, " %s", a.Kind)
+	}
 
 	Print(a.Name, w, opt)
 
@@ -59,28 +74,79 @@ func StmtRes(a *ast.StmtRes, w *LineWriter, opt Option) {
 	io.WriteString(w, "}\n")
 }
 
+func StmtEdge(a *ast.StmtEdge, w *LineWriter, opt Option) {
+	// Start with new line?
+	fmt.Fprintln(w)
+	for i, e := range a.EdgeHalfList {
+		Print(e, w, opt)
+		if i < len(a.EdgeHalfList)-1 {
+			fmt.Fprintf(w, " %s ", "->")
+		}
+	}
+}
+
+func StmtEdgeHalf(a *ast.StmtEdgeHalf, w *LineWriter, opt Option) {
+	fmt.Fprintf(w, "%s%s[", strings.ToUpper(a.Kind[:1]), a.Kind[1:])
+	opt.DropSpace = true
+	Print(a.Name, w, opt)
+	fmt.Fprintf(w, "].%s", a.SendRecv)
+}
+
 func ExprStr(a *ast.ExprStr, w *LineWriter, opt Option) {
 	if opt.DropQuote {
-		fmt.Fprintf(w, " %s", a.V)
+		if opt.DropSpace {
+			fmt.Fprintf(w, "%s", a.V)
+		} else {
+			fmt.Fprintf(w, " %s", a.V)
+		}
 		return
 	}
-	fmt.Fprintf(w, ` "%s"`, a.V)
+
+	if opt.DropSpace {
+		fmt.Fprintf(w, `"%s"`, a.V)
+	} else {
+		fmt.Fprintf(w, ` "%s"`, a.V)
+	}
 }
 
 func ExprInt(a *ast.ExprInt, w *LineWriter, opt Option) {
-	fmt.Fprintf(w, " %d", a.V)
+	if opt.DropSpace {
+		fmt.Fprintf(w, "%d", a.V)
+	} else {
+		fmt.Fprintf(w, " %d", a.V)
+	}
 }
 
 func ExprFloat(a *ast.ExprFloat, w *LineWriter, opt Option) {
-	fmt.Fprintf(w, " %g", a.V)
+	if opt.DropSpace {
+		fmt.Fprintf(w, "%g", a.V)
+	} else {
+		fmt.Fprintf(w, " %g", a.V)
+	}
 }
 
 func ExprBool(a *ast.ExprBool, w *LineWriter, opt Option) {
-	fmt.Fprintf(w, " %t", a.V)
+	if opt.DropSpace {
+		fmt.Fprintf(w, "%t", a.V)
+	} else {
+		fmt.Fprintf(w, " %t", a.V)
+	}
+}
+
+func ExprVar(a *ast.ExprVar, w *LineWriter, opt Option) {
+	if opt.DropSpace {
+		fmt.Fprintf(w, "$%s", a.Name)
+	} else {
+		fmt.Fprintf(w, " $%s", a.Name)
+	}
 }
 
 func StmtResField(a *ast.StmtResField, w *LineWriter, opt Option) {
-	fmt.Fprintf(w, " %s =>", a.Field)
+	if opt.DropSpace {
+		fmt.Fprintf(w, "%s =>", a.Field)
+	} else {
+		fmt.Fprintf(w, " %s =>", a.Field)
+	}
 
 	Print(a.Value, w, opt)
 }
@@ -96,7 +162,11 @@ func ExprCall(a *ast.ExprCall, w *LineWriter, opt Option) {
 
 		Print(a.Args[2], w, opt)
 	default:
-		fmt.Fprintf(w, " %s(", a.Name)
+		if opt.DropSpace {
+			fmt.Fprintf(w, "%s(", a.Name)
+		} else {
+			fmt.Fprintf(w, " %s(", a.Name)
+		}
 
 		for i, arg := range a.Args {
 			opt.DropSpace = false
@@ -104,7 +174,7 @@ func ExprCall(a *ast.ExprCall, w *LineWriter, opt Option) {
 				opt.DropSpace = true
 			}
 			Print(arg, w, opt)
-			if i > 0 && i < len(a.Args)-1 {
+			if i < len(a.Args)-1 {
 				fmt.Fprint(w, ",")
 			}
 		}
