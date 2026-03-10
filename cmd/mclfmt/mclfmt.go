@@ -26,6 +26,8 @@ func main() {
 
 	xast.Apply(func(node interfaces.Node) error {
 		fmt.Printf("node %+v\n", node)
+		fmt.Printf("node %T\n", node)
+		fmt.Printf("node %s\n", node)
 		return nil
 	})
 

@@ -33,6 +33,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"log"
 	"strconv"
 	"strings"
 
@@ -3436,8 +3437,8 @@ OUTER0:
 				s := yylex.Text()
 
 				lval.str = s[1:] // remove the leading #
-				//log.Printf("lang: lexer: comment: `%s`", lval.str)
-				//return COMMENT // skip return to avoid parsing
+				log.Printf("lang: lexer: comment: `%s`", lval.str)
+				return COMMENT // skip return to avoid parsing
 			}
 		case 56:
 			{
