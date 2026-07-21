@@ -1,2 +1,2 @@
-langp: main.go
-	CGO_ENABLED=0 go build -tags 'noaugeas novirt'
+all:
+	go test -bench . -benchmem -cpuprofile cpu.prof -tags 'noaugeas novirt'
