@@ -107,7 +107,7 @@ func (obj *CallFunc) Validate() error {
 func (obj *CallFunc) Info() *interfaces.Info {
 	var typ *types.Type
 	if obj.Type != nil && obj.FuncType != nil { // don't panic if called speculatively
-		typ = types.NewType(fmt.Sprintf("func(%s %s) %s", obj.EdgeName, obj.FuncType, obj.Type))
+		typ = types.NewType("func(" + obj.EdgeName + " " + obj.FuncType.String() + ") " + obj.Type.String())
 	}
 
 	return &interfaces.Info{

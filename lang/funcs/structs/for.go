@@ -32,6 +32,7 @@ package structs
 import (
 	"context"
 	"fmt"
+	"strconv"
 
 	"github.com/purpleidea/mgmt/lang/interfaces"
 	"github.com/purpleidea/mgmt/lang/types"
@@ -135,7 +136,7 @@ func (obj *ForFunc) replaceSubGraph(subgraphInput interfaces.Func) error {
 		argName := "forInputList"
 
 		inputElemFunc := SimpleFnToDirectFunc(
-			fmt.Sprintf("forInputElem[%d]", i),
+			"forInputElem["+strconv.FormatUint(uint64(i), 10)+"]",
 			&types.FuncValue{
 				V: func(_ context.Context, args []types.Value) (types.Value, error) {
 					if len(args) != 1 {
@@ -150,7 +151,7 @@ func (obj *ForFunc) replaceSubGraph(subgraphInput interfaces.Func) error {
 
 					return list.List()[i], nil
 				},
-				T: types.NewType(fmt.Sprintf("func(%s %s) %s", argName, obj.listType(), obj.ValueType)),
+				T: types.NewType("func(" + argName + " " + obj.listType().String() + ") " + obj.ValueType.String()),
 			},
 		)
 		obj.init.Txn.AddVertex(inputElemFunc)
@@ -167,9 +168,7 @@ func (obj *ForFunc) replaceSubGraph(subgraphInput interfaces.Func) error {
 	return obj.init.Txn.Commit()
 }
 
-func (obj *ForFunc) listType() *types.Type {
-	return types.NewType(fmt.Sprintf("[]%s", obj.ValueType))
-}
+func (obj *ForFunc) listType() *types.Type { return types.NewType("[]" + obj.ValueType.String()) }
 
 // Call this function with the input args and return the value if it is possible
 // to do so at this time.

@@ -104,6 +104,7 @@ func (obj *ForKVFunc) Info() *interfaces.Info {
 		// XXX: Improve function engine so it can return no value?
 		//typ = types.NewType(fmt.Sprintf("func(%s map{%s: %s})", obj.EdgeName, obj.KeyType, obj.ValType)) // returns nothing
 		// dummy type to prove we're dropping the output since we don't use it.
+		// TODO(miek)
 		typ = types.NewType(fmt.Sprintf("func(%s map{%s: %s}) nil", obj.EdgeName, obj.KeyType, obj.ValType))
 	}
 
@@ -156,7 +157,7 @@ func (obj *ForKVFunc) replaceSubGraph(subgraphInput interfaces.Func) error {
 					//return m.Map().Index(?), nil
 					return k, nil
 				},
-				T: types.NewType(fmt.Sprintf("func(%s %s) %s", argNameKey, obj.mapType(), obj.KeyType)),
+				T: types.NewType("func(" + argNameKey + " " + obj.mapType().String() + ") " + obj.KeyType.String()),
 			},
 		)
 		obj.init.Txn.AddVertex(inputElemFuncKey)
@@ -187,7 +188,7 @@ func (obj *ForKVFunc) replaceSubGraph(subgraphInput interfaces.Func) error {
 					}
 					return val, nil
 				},
-				T: types.NewType(fmt.Sprintf("func(%s %s) %s", argNameVal, obj.mapType(), obj.ValType)),
+				T: types.NewType("func(" + argNameVal + " " + obj.mapType().String() + ") " + obj.ValType.String()),
 			},
 		)
 		obj.init.Txn.AddVertex(inputElemFuncVal)
@@ -205,7 +206,7 @@ func (obj *ForKVFunc) replaceSubGraph(subgraphInput interfaces.Func) error {
 }
 
 func (obj *ForKVFunc) mapType() *types.Type {
-	return types.NewType(fmt.Sprintf("map{%s: %s}", obj.KeyType, obj.ValType))
+	return types.NewType("map{" + obj.KeyType.String() + ": " + obj.ValType.String() + "}")
 }
 
 // cmpMapKeys compares the input map with the cached private lastForKVMap field.

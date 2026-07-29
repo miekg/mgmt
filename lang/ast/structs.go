@@ -7524,7 +7524,7 @@ type ExprStr struct {
 }
 
 // String returns a short representation of this expression.
-func (obj *ExprStr) String() string { return fmt.Sprintf("str(%s)", strconv.Quote(obj.V)) }
+func (obj *ExprStr) String() string { return "str(" + strconv.Quote(obj.V) + ")" }
 
 // Apply is a general purpose iterator method that operates on any AST node. It
 // is not used as the primary AST traversal function because it is less readable
@@ -7722,7 +7722,7 @@ type ExprInt struct {
 }
 
 // String returns a short representation of this expression.
-func (obj *ExprInt) String() string { return fmt.Sprintf("int(%d)", obj.V) }
+func (obj *ExprInt) String() string { return "int(" + strconv.FormatInt(int64(obj.V), 10) + ")" }
 
 // Apply is a general purpose iterator method that operates on any AST node. It
 // is not used as the primary AST traversal function because it is less readable
@@ -7878,7 +7878,7 @@ type ExprFloat struct {
 
 // String returns a short representation of this expression.
 func (obj *ExprFloat) String() string {
-	return fmt.Sprintf("float(%g)", obj.V) // TODO: %f instead?
+	return "float(" + strconv.FormatFloat(obj.V, 'g', -1, 64) + ")"
 }
 
 // Apply is a general purpose iterator method that operates on any AST node. It
@@ -8041,7 +8041,7 @@ func (obj *ExprList) String() string {
 	for _, x := range obj.Elements {
 		s = append(s, x.String())
 	}
-	return fmt.Sprintf("list(%s)", strings.Join(s, ", "))
+	return "list(" + strings.Join(s, ", ") + ")"
 }
 
 // Apply is a general purpose iterator method that operates on any AST node. It
@@ -8323,7 +8323,7 @@ func (obj *ExprList) Graph(env *interfaces.Env) (*pgraph.Graph, interfaces.Func,
 		}
 		graph.AddGraph(g)
 
-		fieldName := fmt.Sprintf("%d", index) // argNames as integers!
+		fieldName := strconv.FormatInt(int64(index), 10) // argNames as integers!
 		edge := &interfaces.FuncEdge{Args: []string{fieldName}}
 		graph.AddEdge(f, function, edge) // element -> list
 	}
@@ -8405,8 +8405,9 @@ type ExprMap struct {
 func (obj *ExprMap) String() string {
 	var s []string
 	for _, x := range obj.KVs {
-		s = append(s, fmt.Sprintf("%s: %s", x.Key.String(), x.Val.String()))
+		s = append(s, x.Key.String()+": "+x.Val.String())
 	}
+	// TODO(miek)
 	return fmt.Sprintf("map(%s)", strings.Join(s, ", "))
 }
 
@@ -8838,7 +8839,7 @@ func (obj *ExprMap) Graph(env *interfaces.Env) (*pgraph.Graph, interfaces.Func, 
 		graph.AddGraph(g)
 
 		// do the key names ever change? -- yes
-		fieldName := fmt.Sprintf("key:%d", index) // stringify map key
+		fieldName := "key:" + strconv.FormatInt(int64(index), 10) //  stringify map key
 		edge := &interfaces.FuncEdge{Args: []string{fieldName}}
 		graph.AddEdge(f, function, edge) // key -> map
 	}
@@ -8851,7 +8852,7 @@ func (obj *ExprMap) Graph(env *interfaces.Env) (*pgraph.Graph, interfaces.Func, 
 		}
 		graph.AddGraph(g)
 
-		fieldName := fmt.Sprintf("val:%d", index) // stringify map val
+		fieldName := "val:" + strconv.FormatInt(int64(index), 10) //  stringify map val
 		edge := &interfaces.FuncEdge{Args: []string{fieldName}}
 		graph.AddEdge(f, function, edge) // val -> map
 	}
@@ -8978,7 +8979,7 @@ type ExprStruct struct {
 func (obj *ExprStruct) String() string {
 	var s []string
 	for _, x := range obj.Fields {
-		s = append(s, fmt.Sprintf("%s: %s", x.Name, x.Value.String()))
+		s = append(s, x.Name+": "+x.Value.String())
 	}
 	return fmt.Sprintf("struct(%s)", strings.Join(s, "; "))
 }

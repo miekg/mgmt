@@ -59,7 +59,7 @@ func (obj *ConstFunc) String() string {
 		return obj.NameHint
 	}
 	if obj.Value != nil && obj.Value.Type() != nil {
-		return fmt.Sprintf("%s: %s(%s)", ConstFuncName, obj.Value.Type().String(), obj.Value.String())
+		return ConstFuncName + ": " + obj.Value.Type().String() + "(" + obj.Value.String() + ")"
 	}
 	return ConstFuncName
 }
@@ -77,7 +77,7 @@ func (obj *ConstFunc) Info() *interfaces.Info {
 	var typ *types.Type
 	if obj.Value != nil { // don't panic if called speculatively
 		if t := obj.Value.Type(); t != nil {
-			typ = types.NewType(fmt.Sprintf("func() %s", t.String()))
+			typ = types.NewType("func() " + t.String())
 		}
 	}
 	return &interfaces.Info{
