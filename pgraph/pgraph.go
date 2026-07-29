@@ -364,26 +364,42 @@ func (g *Graph) VerticesChan() chan Vertex {
 }
 
 // VertexSlice is a linear list of vertices. It can be sorted.
-type VertexSlice []Vertex
+type VertexSlice struct {
+	Vertices []Vertex
+	cache    map[Vertex]string
+}
 
 // Len returns the length of the slice of vertices.
-func (vs VertexSlice) Len() int { return len(vs) }
+func (vs VertexSlice) Len() int { return len(vs.Vertices) }
 
 // Swap swaps two elements in the slice.
-func (vs VertexSlice) Swap(i, j int) { vs[i], vs[j] = vs[j], vs[i] }
+func (vs VertexSlice) Swap(i, j int) { vs.Vertices[i], vs.Vertices[j] = vs.Vertices[j], vs.Vertices[i] }
 
 // Less returns the smaller element in the sort order.
 func (vs VertexSlice) Less(i, j int) bool {
-	a := vs[i].String()
-	b := vs[j].String()
+	a := vs.cache[vs.Vertices[i]]
+	b := vs.cache[vs.Vertices[j]]
+
+	if a == "" {
+		a = vs.Vertices[i].String()
+		vs.cache[vs.Vertices[i]] = a
+	}
+	if b == "" {
+		b = vs.Vertices[i].String()
+		vs.cache[vs.Vertices[i]] = b
+	}
+
 	if a == b { // fallback to ptr compare
-		return fmt.Sprintf("%p", vs[i]) < fmt.Sprintf("%p", vs[j])
+		return fmt.Sprintf("%p", vs.Vertices[i]) < fmt.Sprintf("%p", vs.Vertices[j])
 	}
 	return a < b
 }
 
 // Sort is a convenience method.
-func (vs VertexSlice) Sort() { sort.Sort(vs) }
+func (vs VertexSlice) Sort() {
+	vs.cache = make(map[Vertex]string)
+	sort.Sort(vs)
+}
 
 // VerticesSorted returns a sorted slice of all vertices in the graph. The order
 // is sorted by String() to avoid the non-determinism in the map type.
@@ -392,7 +408,7 @@ func (g *Graph) VerticesSorted() []Vertex {
 	for k := range g.adjacency {
 		vertices = append(vertices, k)
 	}
-	sort.Sort(VertexSlice(vertices)) // add determinism
+	VertexSlice{Vertices: vertices}.Sort() // add determinism
 	return vertices
 }
 
@@ -420,7 +436,7 @@ func (g *Graph) Sprint() string {
 		for v2 := range g.Adjacency()[v1] {
 			vs = append(vs, v2)
 		}
-		sort.Sort(VertexSlice(vs)) // deterministic order
+		VertexSlice{Vertices: vs}.Sort() // deterministic order
 		for _, v2 := range vs {
 			e := g.Adjacency()[v1][v2]
 			str += fmt.Sprintf("Edge: %s -> %s # %s\n", v1, v2, e)
@@ -753,7 +769,7 @@ func (g *Graph) DeterministicTopologicalSort() ([]Vertex, error) { // kahn's alg
 	for k := range indegree {
 		vertices = append(vertices, k)
 	}
-	sort.Sort(VertexSlice(vertices)) // add determinism
+	VertexSlice{Vertices: vertices}.Sort() // add determinism
 	//for v, d := range g.InDegree()
 	for _, v := range vertices { // map[Vertex]int
 		d := indegree[v]
@@ -776,8 +792,8 @@ func (g *Graph) DeterministicTopologicalSort() ([]Vertex, error) { // kahn's alg
 		for n := range g.adjacency[v] { // map[Vertex]Edge
 			vertices = append(vertices, n)
 		}
-		sort.Sort(VertexSlice(vertices)) // add determinism
-		for _, n := range vertices {     // map[Vertex]Edge
+		VertexSlice{Vertices: vertices}.Sort() // add determinism
+		for _, n := range vertices {           // map[Vertex]Edge
 			// for each node n remaining in the graph, consume from
 			// remaining, so for remaining[n] > 0
 			if remaining[n] > 0 {
@@ -997,7 +1013,7 @@ func Sort(vs []Vertex) []Vertex {
 	for _, v := range vs { // copy
 		vertices = append(vertices, v)
 	}
-	sort.Sort(VertexSlice(vertices))
+	VertexSlice{Vertices: vertices}.Sort()
 	return vertices
 	// sort.Sort(VertexSlice(vs)) // this is wrong, it would modify input!
 	//return vs
