@@ -61,6 +61,8 @@ func init() {
 // is loaded. This is similar to what you can determine from the `lsmod`
 // command. If the module does not even exist, this also returns false.
 type ModinfoLoadedFunc struct {
+	interfaces.Textarea
+
 	init *interfaces.Init
 	last types.Value // last value received to use for diff
 
@@ -140,6 +142,10 @@ func (obj *ModinfoLoadedFunc) Stream(ctx context.Context) error {
 		case event, ok := <-recWatcher.Events():
 			if !ok {
 				return fmt.Errorf("no more events")
+			}
+			if event == nil {
+				// programming error
+				return fmt.Errorf("unexpected nil recwatch event")
 			}
 			if err := event.Error; err != nil {
 				return errwrap.Wrapf(err, "error event received")

@@ -92,6 +92,7 @@ func init() {
 	edgeHalf     *ast.StmtEdgeHalf
 }
 
+%token NEWLINE
 %token OPEN_CURLY CLOSE_CURLY
 %token OPEN_PAREN CLOSE_PAREN
 %token OPEN_BRACK CLOSE_BRACK
@@ -116,21 +117,30 @@ func init() {
 // the higher the precedence."
 // From: https://www.gnu.org/software/bison/manual/html_node/Infix-Calc.html
 // FIXME: a yacc specialist should check the precedence and add more tests!
-%left AND OR
-%nonassoc LT GT LTE GTE EQ NEQ	// TODO: is %nonassoc correct for all of these?
+%nonassoc DEFAULT	// XXX: is %nonassoc correct for this?
+%left OR
+%left AND
+%nonassoc LT GT LTE GTE EQ NEQ IN	// TODO: is %nonassoc correct for all of these?
 %left PLUS MINUS
 %left MULTIPLY DIVIDE
 %right NOT
 //%right EXP	// exponentiation
 %nonassoc ARROW		// XXX: is %nonassoc correct for this?
-%nonassoc DEFAULT	// XXX: is %nonassoc correct for this?
 %nonassoc OPEN_BRACK	// XXX: is %nonassoc correct for this?
-%nonassoc IN		// XXX: is %nonassoc correct for this?
 
 %error IDENTIFIER STRING OPEN_CURLY IDENTIFIER ROCKET BOOL CLOSE_CURLY: errstrParseExpectingComma
 %error IDENTIFIER STRING OPEN_CURLY IDENTIFIER ROCKET STRING CLOSE_CURLY: errstrParseExpectingComma
 %error IDENTIFIER STRING OPEN_CURLY IDENTIFIER ROCKET INTEGER CLOSE_CURLY: errstrParseExpectingComma
 %error IDENTIFIER STRING OPEN_CURLY IDENTIFIER ROCKET FLOAT CLOSE_CURLY: errstrParseExpectingComma
+%error IDENTIFIER STRING OPEN_CURLY IDENTIFIER ROCKET expr CLOSE_CURLY: errstrParseExpectingComma
+// These are the same cases as above but the field is followed by a newline
+// (rather than the close curly) because the resource body now allows NEWLINE
+// tokens between fields.
+%error IDENTIFIER STRING OPEN_CURLY IDENTIFIER ROCKET BOOL NEWLINE: errstrParseExpectingComma
+%error IDENTIFIER STRING OPEN_CURLY IDENTIFIER ROCKET STRING NEWLINE: errstrParseExpectingComma
+%error IDENTIFIER STRING OPEN_CURLY IDENTIFIER ROCKET INTEGER NEWLINE: errstrParseExpectingComma
+%error IDENTIFIER STRING OPEN_CURLY IDENTIFIER ROCKET FLOAT NEWLINE: errstrParseExpectingComma
+%error IDENTIFIER STRING OPEN_CURLY IDENTIFIER ROCKET expr NEWLINE: errstrParseExpectingComma
 
 %error var_identifier EQ BOOL: errstrParseAdditionalEquals
 %error var_identifier EQ STRING: errstrParseAdditionalEquals
@@ -149,6 +159,25 @@ top:
 		//lp := yylex.(*Lexer).parseResult
 		//lp.(*lexParseAST).ast = $1.stmt
 	}
+	// Allow a final stmt without a trailing newline (e.g. input that
+	// doesn't end with `\n`). A NEWLINE here would be handled by the
+	// `prog stmt NEWLINE` rule below, so this only fires at the $end.
+/*
+|	prog stmt
+	{
+		posLast(yylex, yyDollar) // our pos
+		if stmt, ok := $1.stmt.(*ast.StmtProg); ok {
+			stmts := stmt.Body
+			stmts = append(stmts, $2.stmt)
+			prog := &ast.StmtProg{
+				Body: stmts,
+			}
+			locate(yylex, $1, yyDollar[len(yyDollar)-1], prog)
+			lp := cast(yylex)
+			lp.ast = prog
+		}
+	}
+*/
 ;
 prog:
 	/* end of list */
@@ -158,7 +187,7 @@ prog:
 			Body: []interfaces.Stmt{},
 		}
 	}
-|	prog stmt
+|	prog stmt NEWLINE
 	{
 		posLast(yylex, yyDollar) // our pos
 		// TODO: should we just skip comments for now?
@@ -172,6 +201,12 @@ prog:
 			}
 			locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.stmt)
 		}
+	}
+// Skip over nil statements (like a newline)
+|	prog NEWLINE
+	{
+		// newline!
+		$$.stmt = $1.stmt
 	}
 ;
 stmt:
@@ -253,7 +288,7 @@ stmt:
 	// `func name() { <expr> }`
 	// `func name(<arg>) { <expr> }`
 	// `func name(<arg>, <arg>) { <expr> }`
-|	FUNC_IDENTIFIER IDENTIFIER OPEN_PAREN args CLOSE_PAREN OPEN_CURLY expr CLOSE_CURLY
+|	FUNC_IDENTIFIER IDENTIFIER OPEN_PAREN args CLOSE_PAREN OPEN_CURLY opt_newlines expr opt_newlines CLOSE_CURLY
 	{
 		$$.stmt = &ast.StmtFunc{
 			Name: $2.str,
@@ -261,19 +296,19 @@ stmt:
 				Title:  $2.str,
 				Args:   $4.args,
 				Return: nil,
-				Body:   $7.expr,
+				Body:   $8.expr,
 			},
 		}
 		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.stmt)
 	}
 	// `func name(...) <type> { <expr> }`
-|	FUNC_IDENTIFIER IDENTIFIER OPEN_PAREN args CLOSE_PAREN type OPEN_CURLY expr CLOSE_CURLY
+|	FUNC_IDENTIFIER IDENTIFIER OPEN_PAREN args CLOSE_PAREN type OPEN_CURLY opt_newlines expr opt_newlines CLOSE_CURLY
 	{
 		fn := &ast.ExprFunc{
 			Title:  $2.str,
 			Args:   $4.args,
 			Return: $6.typ, // return type is known
-			Body:   $8.expr,
+			Body:   $9.expr,
 		}
 		isFullyTyped := $6.typ != nil // true if set
 		m := make(map[string]*types.Type)
@@ -338,7 +373,7 @@ stmt:
 		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.stmt)
 	}
 	// `include name(...)`
-|	INCLUDE_IDENTIFIER dotted_identifier OPEN_PAREN call_args CLOSE_PAREN
+|	INCLUDE_IDENTIFIER dotted_identifier OPEN_PAREN callargs CLOSE_PAREN
 	{
 		$$.stmt = &ast.StmtInclude{
 			Name: $2.str,
@@ -358,7 +393,7 @@ stmt:
 	}
 	// `include name(...) as foo`
 	// TODO: should we support: `include name(...) as *`
-|	INCLUDE_IDENTIFIER dotted_identifier OPEN_PAREN call_args CLOSE_PAREN AS_IDENTIFIER IDENTIFIER
+|	INCLUDE_IDENTIFIER dotted_identifier OPEN_PAREN callargs CLOSE_PAREN AS_IDENTIFIER IDENTIFIER
 	{
 		$$.stmt = &ast.StmtInclude{
 			Name:  $2.str,
@@ -468,12 +503,12 @@ expr:
 		$$.expr = $1.expr
 		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
 	}
-|	IF expr OPEN_CURLY expr CLOSE_CURLY ELSE OPEN_CURLY expr CLOSE_CURLY
+|	IF expr OPEN_CURLY opt_newlines expr opt_newlines CLOSE_CURLY ELSE OPEN_CURLY opt_newlines expr opt_newlines CLOSE_CURLY
 	{
 		$$.expr = &ast.ExprIf{
 			Condition:  $2.expr,
-			ThenBranch: $4.expr,
-			ElseBranch: $8.expr,
+			ThenBranch: $5.expr,
+			ElseBranch: $11.expr,
 		}
 		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
 	}
@@ -485,8 +520,27 @@ expr:
 	}
 ;
 list:
+	list_single
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.expr = $1.expr
+	}
+|	list_multi
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.expr = $1.expr
+	}
+;
+list_single:
+	OPEN_BRACK CLOSE_BRACK
+	{
+		$$.expr = &ast.ExprList{
+			Elements: []interfaces.Expr{},
+		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
+	}
 	// `[42, 0, -13]`
-	OPEN_BRACK list_elements CLOSE_BRACK
+|	OPEN_BRACK list_single_elements CLOSE_BRACK
 	{
 		$$.expr = &ast.ExprList{
 			Elements: $2.exprs,
@@ -494,28 +548,86 @@ list:
 		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
 	}
 ;
-list_elements:
+list_single_elements:
+	list_single_elements COMMA list_single_element
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.exprs = append($1.exprs, $3.expr)
+	}
+|	list_single_element
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.exprs = append($$.exprs, $1.expr)
+	}
+;
+list_single_element:
+	expr
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.expr = $1.expr
+	}
+;
+list_multi:
+	// `[
+	//	42,
+	//	0,
+	//	-13,
+	// ]`
+	OPEN_BRACK NEWLINE list_multi_elements CLOSE_BRACK
+	{
+		$$.expr = &ast.ExprList{
+			Elements: $3.exprs,
+		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
+	}
+;
+list_multi_elements:
 	/* end of list */
 	{
 		posLast(yylex, yyDollar) // our pos
 		$$.exprs = []interfaces.Expr{}
 	}
-|	list_elements list_element
+|	list_multi_elements list_multi_element
 	{
 		posLast(yylex, yyDollar) // our pos
 		$$.exprs = append($1.exprs, $2.expr)
 	}
-;
-list_element:
-	expr COMMA
+	// Skip over blank lines between elements.
+|	list_multi_elements NEWLINE
 	{
+		posLast(yylex, yyDollar) // our pos
+		$$.exprs = $1.exprs
+	}
+;
+list_multi_element:
+	expr COMMA NEWLINE
+	{
+		posLast(yylex, yyDollar) // our pos
 		$$.expr = $1.expr
-		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
 	}
 ;
 map:
-	// `{"hello" => "there", "world" => "big",}`
-	OPEN_CURLY map_kvs CLOSE_CURLY
+	map_single
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.expr = $1.expr
+	}
+|	map_multi
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.expr = $1.expr
+	}
+;
+map_single:
+	OPEN_CURLY CLOSE_CURLY
+	{
+		$$.expr = &ast.ExprMap{
+			KVs: []*ast.ExprMapKV{},
+		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
+	}
+	// `{"hello" => "there", "world" => "big"}`
+|	OPEN_CURLY map_single_kvs CLOSE_CURLY
 	{
 		$$.expr = &ast.ExprMap{
 			KVs: $2.mapKVs,
@@ -523,63 +635,166 @@ map:
 		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
 	}
 ;
-map_kvs:
+map_single_kvs:
+	map_single_kvs COMMA map_single_kv
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.mapKVs = append($1.mapKVs, $3.mapKV)
+	}
+|	map_single_kv
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.mapKVs = append($$.mapKVs, $1.mapKV)
+	}
+;
+map_single_kv:
+	expr ROCKET expr
+	{
+		$$.mapKV = &ast.ExprMapKV{
+			Key: $1.expr,
+			Val: $3.expr,
+		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.mapKV)
+	}
+;
+map_multi:
+	// `{
+	//	"hello" => "there",
+	//	"world" => "big",
+	// }`
+	OPEN_CURLY NEWLINE map_multi_kvs CLOSE_CURLY
+	{
+		$$.expr = &ast.ExprMap{
+			KVs: $3.mapKVs,
+		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
+	}
+;
+map_multi_kvs:
 	/* end of list */
 	{
 		posLast(yylex, yyDollar) // our pos
 		$$.mapKVs = []*ast.ExprMapKV{}
 	}
-|	map_kvs map_kv
+|	map_multi_kvs map_multi_kv
 	{
 		posLast(yylex, yyDollar) // our pos
 		$$.mapKVs = append($1.mapKVs, $2.mapKV)
 	}
-;
-map_kv:
-	expr ROCKET expr COMMA
+	// Skip over blank lines between kvs.
+|	map_multi_kvs NEWLINE
 	{
 		posLast(yylex, yyDollar) // our pos
+		$$.mapKVs = $1.mapKVs
+	}
+;
+map_multi_kv:
+	expr ROCKET expr COMMA NEWLINE
+	{
 		$$.mapKV = &ast.ExprMapKV{
 			Key: $1.expr,
 			Val: $3.expr,
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.mapKV)
 	}
 ;
 struct:
-	// `struct{answer => 0, truth => false, hello => "world",}`
-	STRUCT_IDENTIFIER OPEN_CURLY struct_fields CLOSE_CURLY
+	struct_single
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.expr = $1.expr
+	}
+|	struct_multi
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.expr = $1.expr
+	}
+;
+struct_single:
+	STRUCT_IDENTIFIER OPEN_CURLY CLOSE_CURLY
+	{
+		$$.expr = &ast.ExprStruct{
+			Fields: []*ast.ExprStructField{},
+		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
+	}
+	// `struct{answer => 0, truth => false, hello => "world"}`
+|	STRUCT_IDENTIFIER OPEN_CURLY struct_single_fields CLOSE_CURLY
 	{
 		$$.expr = &ast.ExprStruct{
 			Fields: $3.structFields,
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
 	}
 ;
-struct_fields:
+struct_single_fields:
+	struct_single_fields COMMA struct_single_field
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.structFields = append($1.structFields, $3.structField)
+	}
+|	struct_single_field
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.structFields = append($$.structFields, $1.structField)
+	}
+;
+struct_single_field:
+	IDENTIFIER ROCKET expr
+	{
+		$$.structField = &ast.ExprStructField{
+			Name:  $1.str,
+			Value: $3.expr,
+		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.structField)
+	}
+;
+struct_multi:
+	// `struct{
+	//	answer => 0,
+	//	truth => false,
+	//	hello => "world"
+	//}`
+	STRUCT_IDENTIFIER OPEN_CURLY NEWLINE struct_multi_fields CLOSE_CURLY
+	{
+		$$.expr = &ast.ExprStruct{
+			Fields: $4.structFields,
+		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
+	}
+;
+struct_multi_fields:
 	/* end of list */
 	{
 		posLast(yylex, yyDollar) // our pos
 		$$.structFields = []*ast.ExprStructField{}
 	}
-|	struct_fields struct_field
+|	struct_multi_fields struct_multi_field
 	{
 		posLast(yylex, yyDollar) // our pos
 		$$.structFields = append($1.structFields, $2.structField)
 	}
-;
-struct_field:
-	IDENTIFIER ROCKET expr COMMA
+	// Skip over blank lines between fields.
+|	struct_multi_fields NEWLINE
 	{
 		posLast(yylex, yyDollar) // our pos
+		$$.structFields = $1.structFields
+	}
+;
+struct_multi_field:
+	IDENTIFIER ROCKET expr COMMA NEWLINE
+	{
 		$$.structField = &ast.ExprStructField{
 			Name:  $1.str,
 			Value: $3.expr,
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.structField)
 	}
 ;
 call:
 	// fmt.printf(...)
 	// iter.map(...)
-	dotted_identifier OPEN_PAREN call_args CLOSE_PAREN
+	dotted_identifier OPEN_PAREN callargs CLOSE_PAREN
 	{
 		$$.expr = &ast.ExprCall{
 			Name: $1.str,
@@ -590,7 +805,7 @@ call:
 	}
 	// calling a function that's stored in a variable (a lambda)
 	// `$foo(4, "hey")` # call function value
-|	dotted_var_identifier OPEN_PAREN call_args CLOSE_PAREN
+|	dotted_var_identifier OPEN_PAREN callargs CLOSE_PAREN
 	{
 		$$.expr = &ast.ExprCall{
 			Name: $1.str,
@@ -602,7 +817,7 @@ call:
 		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
 	}
 	// calling an inline function
-|	func OPEN_PAREN call_args CLOSE_PAREN
+|	func OPEN_PAREN callargs CLOSE_PAREN
 	{
 		$$.expr = &ast.ExprCall{
 			Name: "", // anonymous!
@@ -824,7 +1039,7 @@ call:
 	}
 	// lookup a field in a struct
 	// _struct_lookup($foo, "field")
-	// $foo->field
+	// `$foo->field`
 |	expr ARROW IDENTIFIER
 	{
 		$$.expr = &ast.ExprCall{
@@ -841,7 +1056,7 @@ call:
 	}
 	// lookup a field in a struct with a default
 	// _struct_lookup_optional($foo, "field", "default")
-	// $foo->field || "default"
+	// `$foo->field || "default"`
 |	expr ARROW IDENTIFIER DEFAULT expr
 	{
 		$$.expr = &ast.ExprCall{
@@ -870,22 +1085,84 @@ call:
 ;
 // list order gets us the position of the arg, but named params would work too!
 // this is also used by the include statement when the called class uses args!
-call_args:
+callargs:
 	/* end of list */
 	{
 		posLast(yylex, yyDollar) // our pos
 		$$.exprs = []interfaces.Expr{}
 	}
+|	callargs_single
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.exprs = $1.exprs
+	}
+|	callargs_multi
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.exprs = $1.exprs
+	}
+;
+callargs_single:
+	// `42, "hello", true`
+	callargs_single_args
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.exprs = $1.exprs
+	}
+;
+callargs_single_args:
 	// seems that "left recursion" works here... thanks parser generator!
-|	call_args COMMA expr
+	callargs_single_args COMMA callargs_single_arg
 	{
 		posLast(yylex, yyDollar) // our pos
 		$$.exprs = append($1.exprs, $3.expr)
 	}
-|	expr
+|	callargs_single_arg
 	{
 		posLast(yylex, yyDollar) // our pos
-		$$.exprs = append([]interfaces.Expr{}, $1.expr)
+		$$.exprs = append($$.exprs, $1.expr)
+	}
+;
+callargs_single_arg:
+	expr
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.expr = $1.expr
+	}
+;
+callargs_multi:
+	// 42,
+	// "hello",
+	// true,
+	NEWLINE callargs_multi_args
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.exprs = $2.exprs
+	}
+;
+callargs_multi_args:
+	/* end of list */
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.exprs = []interfaces.Expr{}
+	}
+|	callargs_multi_args callargs_multi_arg
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.exprs = append($1.exprs, $2.expr)
+	}
+	// Skip over blank lines between args.
+|	callargs_multi_args NEWLINE
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.exprs = $1.exprs
+	}
+;
+callargs_multi_arg:
+	expr COMMA NEWLINE
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.expr = $1.expr
 	}
 ;
 var:
@@ -902,22 +1179,22 @@ func:
 	// `func() { <expr> }`
 	// `func(<arg>) { <expr> }`
 	// `func(<arg>, <arg>) { <expr> }`
-	FUNC_IDENTIFIER OPEN_PAREN args CLOSE_PAREN OPEN_CURLY expr CLOSE_CURLY
+	FUNC_IDENTIFIER OPEN_PAREN args CLOSE_PAREN OPEN_CURLY opt_newlines expr opt_newlines CLOSE_CURLY
 	{
 		$$.expr = &ast.ExprFunc{
 			Args: $3.args,
 			//Return: nil,
-			Body: $6.expr,
+			Body: $7.expr,
 		}
 		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
 	}
 	// `func(...) <type> { <expr> }`
-|	FUNC_IDENTIFIER OPEN_PAREN args CLOSE_PAREN type OPEN_CURLY expr CLOSE_CURLY
+|	FUNC_IDENTIFIER OPEN_PAREN args CLOSE_PAREN type OPEN_CURLY opt_newlines expr opt_newlines CLOSE_CURLY
 	{
 		$$.expr = &ast.ExprFunc{
 			Args:   $3.args,
 			Return: $5.typ, // return type is known
-			Body:   $7.expr,
+			Body:   $8.expr,
 		}
 		isFullyTyped := $5.typ != nil // true if set
 		m := make(map[string]*types.Type)
@@ -946,21 +1223,85 @@ func:
 		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
 	}
 ;
+// list order gets us the position of the arg, but named params would work too!
+// this is used by function definitions (named and lambda) and class definitions.
 args:
 	/* end of list */
 	{
 		posLast(yylex, yyDollar) // our pos
 		$$.args = []*interfaces.Arg{}
 	}
-|	args COMMA arg
+|	args_single
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.args = $1.args
+	}
+|	args_multi
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.args = $1.args
+	}
+;
+args_single:
+	// `$a, $b, $c`
+	args_single_list
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.args = $1.args
+	}
+;
+args_single_list:
+	args_single_list COMMA args_single_arg
 	{
 		posLast(yylex, yyDollar) // our pos
 		$$.args = append($1.args, $3.arg)
 	}
-|	arg
+|	args_single_arg
 	{
 		posLast(yylex, yyDollar) // our pos
 		$$.args = append([]*interfaces.Arg{}, $1.arg)
+	}
+;
+args_single_arg:
+	arg
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.arg = $1.arg
+	}
+;
+args_multi:
+	// $a,
+	// $b,
+	// $c,
+	NEWLINE args_multi_list
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.args = $2.args
+	}
+;
+args_multi_list:
+	/* end of list */
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.args = []*interfaces.Arg{}
+	}
+|	args_multi_list args_multi_arg
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.args = append($1.args, $2.arg)
+	}
+	// Skip over blank lines between args.
+|	args_multi_list NEWLINE
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.args = $1.args
+	}
+;
+args_multi_arg:
+	arg COMMA NEWLINE
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.arg = $1.arg
 	}
 ;
 arg:
@@ -1011,10 +1352,10 @@ bind:
 panic:
 	// panic("some error")
 	// generates:
-	// if panic("some error") {
+	// `if panic("some error") {
 	//	_panic "_panic" {} # resource
-	//}
-	PANIC_IDENTIFIER OPEN_PAREN call_args CLOSE_PAREN
+	//}`
+	PANIC_IDENTIFIER OPEN_PAREN callargs CLOSE_PAREN
 	{
 		funcName := $1.str // funcs.PanicFuncName
 		if len($3.exprs) == 2 {
@@ -1025,6 +1366,7 @@ panic:
 			Args: $3.exprs,
 			//Var: false, // default
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], call)
 		name := &ast.ExprStr{
 			V: $1.str, // any constant, non-empty name
 		}
@@ -1043,8 +1385,8 @@ panic:
 ;
 collect:
 	// `collect file "/tmp/hello" { ... }`
-	// `collect file ["/tmp/hello", ...,] { ... }`
-	// `collect file [struct{name => "/tmp/hello", host => "foo",}, ...,] { ... }`
+	// `collect file ["/tmp/hello", ..., ...] { ... }`
+	// `collect file [struct{name => "/tmp/hello", host => "foo"}, ..., ...] { ... }`
 	COLLECT_IDENTIFIER resource
 	{
 		// A "collect" stmt is exactly a regular "res" statement, except
@@ -1073,6 +1415,7 @@ collect:
 				res.Name, // expr (hopefully one of those types)
 			},
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], call)
 		collect := &ast.StmtResCollect{ // special field
 			Kind:  kind, // might as well tell it directly
 			Value: call,
@@ -1155,6 +1498,12 @@ resource_body:
 		posLast(yylex, yyDollar) // our pos
 		$$.resContents = append($1.resContents, $2.resMeta)
 	}
+// Skip over bare newlines between resource body elements.
+|	resource_body NEWLINE
+	{
+		// newline!
+		$$.resContents = $1.resContents
+	}
 ;
 resource_field:
 	IDENTIFIER ROCKET expr COMMA
@@ -1234,7 +1583,7 @@ conditional_resource_meta:
 	}
 ;
 resource_meta_struct:
-	// Meta => struct{meta => true, retry => 3,},
+	// Meta => struct{meta => true, retry => 3},
 	CAPITALIZED_IDENTIFIER ROCKET expr COMMA
 	{
 		if strings.ToLower($1.str) != strings.ToLower(ast.MetaField) {
@@ -1249,7 +1598,7 @@ resource_meta_struct:
 	}
 ;
 conditional_resource_meta_struct:
-	// Meta => $present ?: struct{poll => 60, sema => ["foo:1", "bar:3",],},
+	// Meta => $present ?: struct{poll => 60, sema => ["foo:1", "bar:3"]},
 	CAPITALIZED_IDENTIFIER ROCKET expr ELVIS expr COMMA
 	{
 		if strings.ToLower($1.str) != strings.ToLower(ast.MetaField) {
@@ -1358,8 +1707,14 @@ type:
 		posLast(yylex, yyDollar) // our pos
 		$$.typ = types.NewType(fmt.Sprintf("map{%s: %s}", $3.typ.String(), $5.typ.String()))
 	}
+|	STRUCT_IDENTIFIER OPEN_CURLY CLOSE_CURLY
+	// struct: struct{}
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.typ = types.NewType(fmt.Sprintf("%s{}", $1.str))
+	}
 |	STRUCT_IDENTIFIER OPEN_CURLY type_struct_fields CLOSE_CURLY
-	// struct: struct{} or struct{a bool} or struct{a bool; bb int}
+	// struct: struct{a bool} or struct{a bool; bb int}
 	{
 		posLast(yylex, yyDollar) // our pos
 
@@ -1426,12 +1781,7 @@ type:
 	}
 ;
 type_struct_fields:
-	/* end of list */
-	{
-		posLast(yylex, yyDollar) // our pos
-		$$.args = []*interfaces.Arg{}
-	}
-|	type_struct_fields SEMICOLON type_struct_field
+	type_struct_fields SEMICOLON type_struct_field
 	{
 		posLast(yylex, yyDollar) // our pos
 		$$.args = append($1.args, $3.arg)
@@ -1452,22 +1802,86 @@ type_struct_field:
 		}
 	}
 ;
+// type_func_args is the arg list inside a function type signature, e.g.
+// `func(int, str) str` or `func(a int, b str) str`. Same single/multi split
+// pattern as `args`: single line forbids a trailing comma, multi line
+// requires one after every arg (including the last).
 type_func_args:
 	/* end of list */
 	{
 		posLast(yylex, yyDollar) // our pos
 		$$.args = []*interfaces.Arg{}
 	}
-|	type_func_args COMMA type_func_arg
+|	type_func_args_single
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.args = $1.args
+	}
+|	type_func_args_multi
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.args = $1.args
+	}
+;
+type_func_args_single:
+	// `int, str` or `a int, b str`
+	type_func_args_single_list
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.args = $1.args
+	}
+;
+type_func_args_single_list:
+	type_func_args_single_list COMMA type_func_args_single_arg
 	{
 		posLast(yylex, yyDollar) // our pos
 		$$.args = append($1.args, $3.arg)
 	}
-|	type_func_arg
+|	type_func_args_single_arg
 	{
 		posLast(yylex, yyDollar) // our pos
 		$$.args = append([]*interfaces.Arg{}, $1.arg)
-		//$$.args = []*interfaces.Arg{$1.arg} // TODO: is this equivalent?
+	}
+;
+type_func_args_single_arg:
+	type_func_arg
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.arg = $1.arg
+	}
+;
+type_func_args_multi:
+	// int,
+	// str,
+	NEWLINE type_func_args_multi_list
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.args = $2.args
+	}
+;
+type_func_args_multi_list:
+	/* end of list */
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.args = []*interfaces.Arg{}
+	}
+|	type_func_args_multi_list type_func_args_multi_arg
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.args = append($1.args, $2.arg)
+	}
+	// Skip over blank lines between args.
+|	type_func_args_multi_list NEWLINE
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.args = $1.args
+	}
+;
+type_func_args_multi_arg:
+	type_func_arg COMMA NEWLINE
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.arg = $1.arg
 	}
 ;
 type_func_arg:
@@ -1513,6 +1927,8 @@ var_identifier:
 	{
 		posLast(yylex, yyDollar) // our pos
 		$$.str = $2.str // don't include the leading $
+		$$.endRow = $2.endRow // propagate end position from identifier
+		$$.endCol = $2.endCol
 	}
 ;
 colon_identifier:
@@ -1548,6 +1964,8 @@ dotted_var_identifier:
 	{
 		posLast(yylex, yyDollar) // our pos
 		$$.str = $2.str // don't include the leading $
+		$$.endRow = $2.endRow // propagate end position from identifier
+		$$.endCol = $2.endCol
 	}
 ;
 capitalized_res_identifier:
@@ -1560,6 +1978,20 @@ capitalized_res_identifier:
 	{
 		posLast(yylex, yyDollar) // our pos
 		$$.str = $1.str + $2.str + $3.str
+	}
+;
+// opt_newlines consumes zero or more NEWLINE tokens and produces nothing. It is
+// used to allow optional newlines around an expr inside curly brace constructs
+// (eg: lambda bodies, named func bodies, and if-expression branches) so that
+// the same rule can accept both single line and multi line forms.
+opt_newlines:
+	/* empty */
+	{
+		// no newline
+	}
+|	opt_newlines NEWLINE
+	{
+		// newline!
 	}
 ;
 %%

@@ -59,6 +59,8 @@ var _ interfaces.DataFunc = &ReadFileFunc{}
 // static. Please note that this is different from the readfile function in the
 // os package.
 type ReadFileFunc struct {
+	interfaces.Textarea
+
 	init *interfaces.Init
 	data *interfaces.FuncData
 }
@@ -114,6 +116,8 @@ func (obj *ReadFileFunc) Init(init *interfaces.Init) error {
 // function.
 func (obj *ReadFileFunc) Copy() interfaces.Func {
 	return &ReadFileFunc{
+		Textarea: obj.Textarea,
+
 		init: obj.init, // likely gets overwritten anyways
 		data: obj.data, // needed because we don't call SetData twice
 	}
@@ -146,9 +150,9 @@ func (obj *ReadFileFunc) Call(ctx context.Context, args []types.Value) (types.Va
 	if obj.init == nil || obj.data == nil {
 		return nil, funcs.ErrCantSpeculate
 	}
-	fs, err := obj.init.World.Fs(obj.data.FsURI) // open the remote file system
+	fs, err := obj.init.World.Fs(ctx, obj.data.FsURI) // open the remote file system
 	if err != nil {
-		return nil, errwrap.Wrapf(err, "can't load code from file system `%s`", obj.data.FsURI)
+		return nil, errwrap.Wrapf(err, "can't load data from file system `%s`", obj.data.FsURI)
 	}
 	// this is relative to the module dir the func is in!
 	content, err := fs.ReadFile(path) // open the remote file system

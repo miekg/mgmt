@@ -6,17 +6,17 @@ import "example"
 $secplusone = datetime.now() + $ayear
 
 # note the order of the assignment (year can come later in the code)
-$ayear = 60 * 60 * 24 * 365	# is a year in seconds (31536000)
+$ayear = 60 * 60 * 24 * 365 # is a year in seconds (31536000)
 
-$tmplvalues = struct{year => $secplusone, load => $theload, vumeter => $vumeter,}
+$tmplvalues = struct{year => $secplusone, load => $theload, vumeter => $vumeter}
 
-$theload float = sys.load()->x1	# ambiguous so we specify the type!
+$theload float = sys.load()->x1 # ambiguous so we specify the type!
 
 $vumeter = example.vumeter("====", 10, 0.9)
 
 file "/tmp/mgmt/datetime" {
 	state => $const.res.file.state.exists,
-	content => golang.template("Now + 1 year is: {{ .year }} seconds, aka: {{ datetime_print .year }}\n\nload average: {{ .load }}\n\nvu: {{ .vumeter }}\n", $tmplvalues),
+	content => golang.template("Now + 1 year is: {{ .Year }} seconds, aka: {{ datetime_print .Year }}\n\nload average: {{ .Load }}\n\nvu: {{ .Vumeter }}\n", $tmplvalues),
 }
 
 file "/tmp/mgmt/" {

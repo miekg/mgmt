@@ -162,7 +162,7 @@ func (obj *VirtRes) Default() engine.Res {
 // Validate if the params passed in are valid data.
 func (obj *VirtRes) Validate() error {
 	// XXX: Code requires polling for the mainloop for now.
-	if obj.MetaParams().Poll > 0 {
+	if obj.MetaParams().Poll != 0 {
 		return fmt.Errorf("can't poll with virt resources")
 	}
 
@@ -189,10 +189,6 @@ func (obj *VirtRes) Validate() error {
 func (obj *VirtRes) Init(init *engine.Init) error {
 	obj.init = init // save for later
 
-	if err := libvirtInit(); err != nil {
-		return err
-	}
-
 	var u *url.URL
 	var err error
 	if u, err = url.Parse(obj.URI); err != nil {
@@ -217,9 +213,6 @@ func (obj *VirtRes) Cleanup() error {
 
 // Watch is the primary listener for this resource and it outputs events.
 func (obj *VirtRes) Watch(ctx context.Context) error {
-	wg := &sync.WaitGroup{}
-	defer wg.Wait() // wait until everyone has exited before we exit!
-
 	// XXX: we're using two connections per resource, we could pool these up
 	conn, _, err := obj.Auth.Connect(obj.URI)
 	if err != nil {
@@ -243,6 +236,7 @@ func (obj *VirtRes) Watch(ctx context.Context) error {
 		if err != nil {
 			return errwrap.Wrapf(err, "could not lookup MaxCPUs on init")
 		}
+		//nolint:gosec // G115: libvirt returns a non-negative vCPU count (err checked above)
 		maxCPUs := uint(i)
 		if obj.MaxCPUs != maxCPUs { // max cpu slots is hard to change
 			// we'll need to reboot to fix this one...
@@ -286,7 +280,6 @@ func (obj *VirtRes) Watch(ctx context.Context) error {
 	domChan := make(chan libvirt.DomainEventType)
 	gaChan := make(chan *libvirt.DomainEventAgentLifecycle)
 	recChan := recWatcher.Events()
-	errorChan := make(chan error)
 
 	// domain events callback
 	domCallback := func(c *libvirt.Connect, d *libvirt.Domain, ev *libvirt.DomainEventLifecycle) {
@@ -327,45 +320,9 @@ func (obj *VirtRes) Watch(ctx context.Context) error {
 	}
 	defer conn.DomainEventDeregister(gaCallbackID)
 
-	// run libvirt event loop
-	// TODO: *trigger* EventRunDefaultImpl to unblock so it can shut down...
-	// at the moment this isn't a major issue because it seems to unblock in
-	// bursts every 5 seconds! we can do this by writing to an event handler
-	// in the meantime, terminating the program causes it to exit anyways...
-	wg.Add(1) // don't exit without waiting for EventRunDefaultImpl
-	go func() {
-		defer wg.Done()
-		defer func() {
-			if !obj.init.Debug {
-				return
-			}
-			obj.init.Logf("EventRunDefaultImpl exited!")
-		}()
-		defer close(errorChan)
-		for {
-			// TODO: can we merge this into our main for loop below?
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-
-			//obj.init.Logf("EventRunDefaultImpl started!")
-			err := libvirt.EventRunDefaultImpl()
-			if err == nil {
-				//obj.init.Logf("EventRunDefaultImpl looped!")
-				continue
-			}
-
-			select {
-			case errorChan <- errwrap.Wrapf(err, "EventRunDefaultImpl failed"):
-			case <-ctx.Done():
-			}
-			return
-		}
-	}()
-
-	obj.init.Running() // when started, notify engine that we're running
+	if err := obj.init.Event(ctx); err != nil {
+		return err
+	}
 
 	send := false // send event?
 	for {
@@ -461,6 +418,10 @@ func (obj *VirtRes) Watch(ctx context.Context) error {
 				// TODO: Should we restart it?
 				recChan = nil
 			}
+			if event == nil {
+				// programming error
+				return fmt.Errorf("unexpected nil recwatch event")
+			}
 			if err := event.Error; err != nil {
 				return errwrap.Wrapf(err, "unknown %s watcher error", obj)
 			}
@@ -469,15 +430,6 @@ func (obj *VirtRes) Watch(ctx context.Context) error {
 			}
 			send = true
 
-		case err, ok := <-errorChan:
-			if !ok {
-				return nil
-			}
-			if err == nil { // unlikely
-				continue
-			}
-			return errwrap.Wrapf(err, "unknown libvirt error")
-
 		case <-ctx.Done(): // closed by the engine to signal shutdown
 			return ctx.Err()
 		}
@@ -485,7 +437,9 @@ func (obj *VirtRes) Watch(ctx context.Context) error {
 		// do all our event sending all together to avoid duplicate msgs
 		if send {
 			send = false
-			obj.init.Event() // notify engine of an event (this can block)
+			if err := obj.init.Event(ctx); err != nil {
+				return err
+			}
 		}
 	}
 }
@@ -715,6 +669,7 @@ func (obj *VirtRes) attrCheckApply(ctx context.Context, apply bool, dom *libvirt
 		if err != nil {
 			return false, errwrap.Wrapf(err, "domain.GetVcpus failed from qemu-guest-agent")
 		}
+		//nolint:gosec // G115: libvirt returns a non-negative vCPU count (err checked above)
 		onlineCPUs := uint(i)
 		if onlineCPUs != obj.CPUs {
 			if !apply {
@@ -955,7 +910,7 @@ func (obj *VirtRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 }
 
 // getDomainType returns the correct domain type based on the uri.
-func (obj VirtRes) getDomainType() string {
+func (obj *VirtRes) getDomainType() string {
 	switch obj.uriScheme {
 	case lxcURI:
 		return "<domain type='lxc'>"
@@ -965,7 +920,7 @@ func (obj VirtRes) getDomainType() string {
 }
 
 // getOSType returns the correct os type based on the uri.
-func (obj VirtRes) getOSType() string {
+func (obj *VirtRes) getOSType() string {
 	switch obj.uriScheme {
 	case lxcURI:
 		return "<type>exe</type>"
@@ -974,7 +929,7 @@ func (obj VirtRes) getOSType() string {
 	}
 }
 
-func (obj VirtRes) getOSInit() string {
+func (obj *VirtRes) getOSInit() string {
 	switch obj.uriScheme {
 	case lxcURI:
 		return fmt.Sprintf("<init>%s</init>", obj.OSInit)
@@ -990,6 +945,15 @@ func (obj *VirtRes) getDomainXML() string {
 	b += obj.getDomainType() // start domain
 
 	b += fmt.Sprintf("<name>%s</name>", obj.Name())
+
+	// with this, live migrate only runs safely with identical host hardware
+	//b += "<cpu mode='host-passthrough' check='none' migratable='on' />"
+
+	// this gets us avx instructions, otherwise if not specified, cpu is bad
+	b += "<cpu mode='host-model'>" // check='partial' is added automatically
+	b += "<model fallback='forbid'>qemu64</model>"
+	b += "</cpu>"
+
 	b += fmt.Sprintf("<memory unit='KiB'>%d</memory>", obj.Memory)
 
 	if obj.HotCPUs {
@@ -1347,6 +1311,13 @@ func (obj *VirtRes) UIDs() []engine.ResUID {
 		// TODO: add more properties here so we can link to vm dependencies
 	}
 	return []engine.ResUID{x}
+}
+
+// Background is a worker function which is run once per resource kind as long
+// as there is at least one of that kind running in the active resource graph.
+// The worker function is the generated (returned) function that is used here.
+func (obj *VirtRes) Background(handle *engine.BackgroundHandle) engine.BackgroundFunc {
+	return libvirtNewBackgroundBool(handle)
 }
 
 // UnmarshalYAML is the custom unmarshal handler for this struct. It is

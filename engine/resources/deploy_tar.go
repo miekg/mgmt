@@ -74,10 +74,10 @@ type DeployTar struct {
 	// file, it must not end with a slash.
 	Path string `lang:"path" yaml:"path"`
 
-	// Format is the header format to use. If you change this, then the
-	// file will get rearchived. The strange thing is that it seems the
-	// header format is stored for each individual file. The available
-	// values are: const.res.tar.format.unknown, const.res.tar.format.ustar,
+	// Format is the header format to use. If you change this, then the file
+	// will get rearchived. The strange thing is that it seems the header
+	// format is stored for each individual file. The available values are:
+	// const.res.tar.format.unknown, const.res.tar.format.ustar,
 	// const.res.tar.format.pax, and const.res.tar.format.gnu which have
 	// values of 0, 2, 4, and 8 respectively.
 	Format int `lang:"format" yaml:"format"`
@@ -156,7 +156,9 @@ func (obj *DeployTar) Watch(ctx context.Context) error {
 	}
 	defer recWatcher.Close()
 
-	obj.init.Running() // when started, notify engine that we're running
+	if err := obj.init.Event(ctx); err != nil {
+		return err
+	}
 
 	for {
 		select {
@@ -167,6 +169,10 @@ func (obj *DeployTar) Watch(ctx context.Context) error {
 				//return nil
 				return fmt.Errorf("unexpected close")
 			}
+			if event == nil {
+				// programming error
+				return fmt.Errorf("unexpected nil recwatch event")
+			}
 			if err := event.Error; err != nil {
 				return errwrap.Wrapf(err, "unknown %s watcher error", obj)
 			}
@@ -175,10 +181,12 @@ func (obj *DeployTar) Watch(ctx context.Context) error {
 			}
 
 		case <-ctx.Done(): // closed by the engine to signal shutdown
-			return nil
+			return ctx.Err()
 		}
 
-		obj.init.Event() // notify engine of an event (this can block)
+		if err := obj.init.Event(ctx); err != nil {
+			return err
+		}
 	}
 }
 
@@ -188,9 +196,9 @@ func (obj *DeployTar) Watch(ctx context.Context) error {
 func (obj *DeployTar) CheckApply(ctx context.Context, apply bool) (bool, error) {
 	uri := obj.init.World.URI() // request each time to ensure it's fresh!
 
-	filesystem, err := obj.init.World.Fs(uri) // open the remote file system
+	filesystem, err := obj.init.World.Fs(ctx, uri) // open the remote file system
 	if err != nil {
-		return false, errwrap.Wrapf(err, "can't load code from file system `%s`", uri)
+		return false, errwrap.Wrapf(err, "can't load data from file system `%s`", uri)
 	}
 
 	h1, err := obj.hashFile(obj.getPath()) // output

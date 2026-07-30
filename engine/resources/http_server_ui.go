@@ -319,6 +319,7 @@ func (obj *HTTPServerUIRes) ServeHTTP(w http.ResponseWriter, req *http.Request) 
 		h["path"] = obj.getPath()
 		if obj.Data != nil {
 			h["title"] = obj.Data.Title // template var
+			//nolint:gosec // G203: Head is operator-configured raw HTML, not attacker input
 			h["head"] = template.HTML(obj.Data.Head)
 		}
 		c.HTML(http.StatusOK, httpServerUIIndexHTMLTmpl, h)
@@ -536,10 +537,13 @@ func (obj *HTTPServerUIRes) Init(init *engine.Init) error {
 
 		obj.eventsChanMap[r] = make(chan error)
 		obj.notifications[r] = make(map[chan struct{}]struct{})
-		event := func() {
+		event := func(ctx context.Context) error {
 			select {
 			case obj.eventsChanMap[r] <- nil:
 				// send!
+
+			case <-ctx.Done():
+				return ctx.Err()
 			}
 
 			obj.rwmutex.RLock()
@@ -556,7 +560,9 @@ func (obj *HTTPServerUIRes) Init(init *engine.Init) error {
 			// We don't do this here (why?) we instead read from the
 			// above channel and then send on multiplexedChan to the
 			// main loop, where it runs the obj.init.Event function.
-			//obj.init.Event() // notify engine of an event (this can block)
+			//if err := obj.init.Event(ctx); err != nil { return err }
+
+			return nil
 		}
 
 		newInit := &engine.Init{
@@ -565,8 +571,7 @@ func (obj *HTTPServerUIRes) Init(init *engine.Init) error {
 			Hostname: obj.init.Hostname,
 
 			// Watch:
-			Running: event,
-			Event:   event,
+			Event: event,
 
 			// CheckApply:
 			//Refresh: func() bool { // TODO: do we need this?
@@ -634,7 +639,7 @@ func (obj *HTTPServerUIRes) Watch(ctx context.Context) error {
 				}
 			}
 		}()
-		// wait for Watch first Running() call or immediate error...
+		// wait for Watch first Event() call or immediate error...
 		select {
 		case <-obj.eventsChanMap[res]: // triggers on start or on err...
 		}
@@ -664,10 +669,9 @@ func (obj *HTTPServerUIRes) Watch(ctx context.Context) error {
 	}
 	// we block until all the children are started first...
 
-	obj.init.Running() // when started, notify engine that we're running
-
-	startupChan := make(chan struct{})
-	close(startupChan) // send one initial signal
+	if err := obj.init.Event(ctx); err != nil {
+		return err
+	}
 
 	for {
 		if obj.init.Debug {
@@ -675,9 +679,6 @@ func (obj *HTTPServerUIRes) Watch(ctx context.Context) error {
 		}
 
 		select {
-		case <-startupChan:
-			startupChan = nil
-
 		//case err, ok := <-obj.eventStream:
 		//	if !ok { // shouldn't happen
 		//		obj.eventStream = nil
@@ -697,10 +698,12 @@ func (obj *HTTPServerUIRes) Watch(ctx context.Context) error {
 			}
 
 		case <-ctx.Done(): // closed by the engine to signal shutdown
-			return nil
+			return ctx.Err()
 		}
 
-		obj.init.Event() // notify engine of an event (this can block)
+		if err := obj.init.Event(ctx); err != nil {
+			return err
+		}
 	}
 
 	//return nil // unreachable

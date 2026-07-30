@@ -32,17 +32,14 @@ package resources
 import (
 	"context"
 	"fmt"
-	"io"
-	"os/exec"
 	"os/user"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
-	"syscall"
 
 	"github.com/purpleidea/mgmt/engine"
 	"github.com/purpleidea/mgmt/engine/traits"
+	engineUtil "github.com/purpleidea/mgmt/engine/util"
 	"github.com/purpleidea/mgmt/util"
 	"github.com/purpleidea/mgmt/util/errwrap"
 	"github.com/purpleidea/mgmt/util/recwatch"
@@ -52,7 +49,11 @@ func init() {
 	engine.RegisterResource("user", func() engine.Res { return &UserRes{} })
 }
 
-// UserRes is a user account resource.
+var _ engine.EdgeableRes = &UserRes{} // compile time check
+
+// UserRes is a user account resource. Managing POSIX users and groups is sneaky
+// and annoying. It turns out that you can't *just* create a user without any
+// group.
 type UserRes struct {
 	traits.Base // add the base methods without re-implementation
 	traits.Edgeable
@@ -75,7 +76,11 @@ type UserRes struct {
 	// Groups are a list of supplemental groups.
 	Groups []string `lang:"groups" yaml:"groups"`
 
-	// HomeDir is the path to the user's home directory.
+	// HomeDir is the path to the user's home directory. It must end with a
+	// trailing slash as it's a directory. For compatibility reasons with
+	// legacy tools, we always store a version without the trailing slash.
+	// If you have a use case that requires that slash, please let us know.
+	// The version stored is cleaned and isn't stored verbatim.
 	HomeDir *string `lang:"homedir" yaml:"homedir"`
 
 	// Shell is the users login shell. Many options may exist in the
@@ -96,6 +101,7 @@ func (obj *UserRes) Default() engine.Res {
 
 // Validate if the params passed in are valid data.
 func (obj *UserRes) Validate() error {
+	// XXX: this does not enforce "strict mode" which requires all lowercase
 	if err := util.ValidUser(obj.Name()); err != nil {
 		return fmt.Errorf("user contains invalid character(s)")
 	}
@@ -122,6 +128,12 @@ func (obj *UserRes) Validate() error {
 			if err := util.ValidUser(group); err != nil { // groups too
 				return fmt.Errorf("groups list contains invalid character(s)")
 			}
+			if obj.Group != nil && group == *obj.Group {
+				return fmt.Errorf("primary Group %q must not appear in Groups", group)
+			}
+			if group == obj.Name() {
+				return fmt.Errorf("user name %q must not appear in Groups", group)
+			}
 		}
 	}
 
@@ -145,24 +157,56 @@ func (obj *UserRes) Cleanup() error {
 }
 
 // Watch is the primary listener for this resource and it outputs events.
+//
+// We watch both /etc/passwd and /etc/group: the user's primary group, UID,
+// shell and home live in passwd, but supplemental group membership lives in
+// group. Tools like `gpasswd -a` only touch /etc/group, so without watching it
+// drift in the Groups field would never wake us.
 func (obj *UserRes) Watch(ctx context.Context) error {
-	recWatcher, err := recwatch.NewRecWatcher(util.EtcPasswdFile, false)
+	passwdWatcher, err := recwatch.NewRecWatcher(util.EtcPasswdFile, false)
 	if err != nil {
 		return err
 	}
-	defer recWatcher.Close()
+	defer passwdWatcher.Close()
 
-	obj.init.Running() // when started, notify engine that we're running
+	groupWatcher, err := recwatch.NewRecWatcher(util.EtcGroupFile, false)
+	if err != nil {
+		return err
+	}
+	defer groupWatcher.Close()
+
+	if err := obj.init.Event(ctx); err != nil {
+		return err
+	}
 
 	for {
 		if obj.init.Debug {
-			obj.init.Logf("watching: %s", util.EtcPasswdFile) // attempting to watch...
+			obj.init.Logf("watching: %s, %s", util.EtcPasswdFile, util.EtcGroupFile)
 		}
 
 		select {
-		case event, ok := <-recWatcher.Events():
+		case event, ok := <-passwdWatcher.Events():
 			if !ok { // channel shutdown
 				return nil
+			}
+			if event == nil {
+				// programming error
+				return fmt.Errorf("unexpected nil recwatch event")
+			}
+			if err := event.Error; err != nil {
+				return errwrap.Wrapf(err, "unknown %s watcher error", obj)
+			}
+			if obj.init.Debug { // don't access event.Body if event.Error isn't nil
+				obj.init.Logf("event(%s): %v", event.Body.Name, event.Body.Op)
+			}
+
+		case event, ok := <-groupWatcher.Events():
+			if !ok { // channel shutdown
+				return nil
+			}
+			if event == nil {
+				// programming error
+				return fmt.Errorf("unexpected nil recwatch event")
 			}
 			if err := event.Error; err != nil {
 				return errwrap.Wrapf(err, "unknown %s watcher error", obj)
@@ -172,28 +216,40 @@ func (obj *UserRes) Watch(ctx context.Context) error {
 			}
 
 		case <-ctx.Done(): // closed by the engine to signal shutdown
-			return nil
+			return ctx.Err()
 		}
 
-		obj.init.Event() // notify engine of an event (this can block)
+		if err := obj.init.Event(ctx); err != nil {
+			return err
+		}
 	}
 }
 
 // CheckApply method for User resource.
 func (obj *UserRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
+	user := defaultUserFuncs // shadows os/user inside this function
+
 	exists := true
 	usr, err := user.Lookup(obj.Name())
 	if err != nil {
-		if _, ok := err.(user.UnknownUserError); !ok {
+		if !isUnknownUser(err) {
 			return false, errwrap.Wrapf(err, "error looking up user")
 		}
 		exists = false
 	}
 
-	if obj.AllowDuplicateUID == false && obj.UID != nil {
+	if obj.State == "absent" && !exists {
+		return true, nil
+	}
+
+	// Only enforce UID uniqueness when we plan to create or modify the
+	// user. For state=absent with a missing user we returned above and for
+	// state=absent with an existing user, we're about to delete it, so a
+	// clash on the (about-to-be-released) UID is not our concern.
+	if obj.State == "exists" && !obj.AllowDuplicateUID && obj.UID != nil {
 		existingUID, err := user.LookupId(strconv.Itoa(int(*obj.UID)))
 		if err != nil {
-			if _, ok := err.(user.UnknownUserIdError); !ok {
+			if !isUnknownUserID(err) {
 				return false, errwrap.Wrapf(err, "error looking up UID")
 			}
 		} else if existingUID.Username != obj.Name() {
@@ -201,17 +257,16 @@ func (obj *UserRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 		}
 	}
 
-	if obj.State == "absent" && !exists {
-		return true, nil
-	}
-
 	groups := []string{}
-	if usr != nil { // if it doesn't exist, we don't have any groups yet
-		gids, err := usr.GroupIds() // ([]string, error)
+	if usr != nil && obj.Groups != nil { // if it doesn't exist, we don't have any groups yet
+		gids, err := user.GroupIds(usr) // ([]string, error)
 		if err != nil {
 			return false, err
 		}
 		for _, gid := range gids {
+			if gid == usr.Gid {
+				continue
+			}
 			g, err := user.LookupGroupId(gid)
 			if err != nil {
 				return false, err
@@ -221,10 +276,7 @@ func (obj *UserRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 	}
 
 	if usercheck := true; exists && obj.State == "exists" {
-		shell, err := util.UserShell(ctx, obj.Name())
-		if err != nil {
-			return false, err
-		}
+		shell := ""
 		intUID, err := strconv.Atoi(usr.Uid)
 		if err != nil {
 			return false, errwrap.Wrapf(err, "error casting UID to int")
@@ -240,6 +292,13 @@ func (obj *UserRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 			usercheck = false
 		}
 
+		if obj.Shell != nil {
+			shell, err = user.Shell(ctx, obj.Name())
+			if err != nil {
+				return false, err
+			}
+		}
+
 		// Check our primary group matches what we requested...
 		if obj.Group != nil {
 			g, err := user.LookupGroupId(usr.Gid)
@@ -253,10 +312,7 @@ func (obj *UserRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 		}
 
 		// Check our member groups match what we expect. (In any order.)
-		cmpGroups := func(g1, g2 []string) error {
-			return cmpListContents(g1, g2)
-		}
-		if cmpGroups(obj.Groups, groups) != nil {
+		if obj.Groups != nil && engineUtil.StrSetCmp(obj.Groups, groups) != nil {
 			usercheck = false
 		}
 
@@ -279,6 +335,7 @@ func (obj *UserRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 		if obj.Shell != nil && *obj.Shell != shell {
 			usercheck = false
 		}
+
 		if usercheck {
 			return true, nil
 		}
@@ -302,10 +359,10 @@ func (obj *UserRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 			args = append(args, "--non-unique")
 		}
 		if obj.UID != nil {
-			args = append(args, "--uid", fmt.Sprintf("%d", *obj.UID))
+			args = append(args, "--uid", strconv.FormatUint(uint64(*obj.UID), 10))
 		}
 		if obj.GID != nil {
-			args = append(args, "--gid", fmt.Sprintf("%d", *obj.GID))
+			args = append(args, "--gid", strconv.FormatUint(uint64(*obj.GID), 10))
 		}
 		if obj.Group != nil {
 			args = append(args, "--gid", *obj.Group)
@@ -314,10 +371,13 @@ func (obj *UserRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 			args = append(args, "--groups", strings.Join(obj.Groups, ","))
 		}
 		if obj.HomeDir != nil {
-			args = append(args, "--home", *obj.HomeDir)
+			args = append(args, "--home", filepath.Clean(*obj.HomeDir))
 		}
 		if obj.Shell != nil {
 			args = append(args, "--shell", *obj.Shell)
+		}
+		if exists && len(args) == 0 {
+			return true, nil
 		}
 	}
 	if obj.State == "absent" {
@@ -328,30 +388,8 @@ func (obj *UserRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 
 	args = append(args, obj.Name())
 
-	cmd := exec.CommandContext(ctx, cmdName, args...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setpgid: true,
-		Pgid:    0,
-	}
-
-	// open a pipe to get error messages from os/exec
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return false, errwrap.Wrapf(err, "failed to initialize stderr pipe")
-	}
-
-	// start the command
-	if err := cmd.Start(); err != nil {
-		return false, errwrap.Wrapf(err, "cmd failed to start")
-	}
-	// capture any error messages
-	slurp, err := io.ReadAll(stderr)
-	if err != nil {
-		return false, errwrap.Wrapf(err, "error slurping error message")
-	}
-	// wait until cmd exits and return error message if any
-	if err := cmd.Wait(); err != nil {
-		return false, errwrap.Wrapf(err, "%s", slurp)
+	if err := user.RunCmd(ctx, cmdName, args); err != nil {
+		return false, err
 	}
 
 	return false, nil
@@ -384,23 +422,20 @@ func (obj *UserRes) Cmp(r engine.Res) error {
 			return fmt.Errorf("the GID differs")
 		}
 	}
-	if (obj.Groups == nil) != (res.Groups == nil) {
+
+	if (obj.Group == nil) != (res.Group == nil) {
 		return fmt.Errorf("the Group differs")
 	}
-	if obj.Groups != nil && res.Groups != nil {
-		if len(obj.Groups) != len(res.Groups) {
+	if obj.Group != nil && res.Group != nil {
+		if *obj.Group != *res.Group {
 			return fmt.Errorf("the Group differs")
 		}
-		objGroups := obj.Groups
-		resGroups := res.Groups
-		sort.Strings(objGroups)
-		sort.Strings(resGroups)
-		for i := range objGroups {
-			if objGroups[i] != resGroups[i] {
-				return fmt.Errorf("the Group differs at index: %d", i)
-			}
-		}
 	}
+
+	if err := engineUtil.StrSetCmp(obj.Groups, res.Groups); err != nil {
+		return errwrap.Wrapf(err, "the Groups differ")
+	}
+
 	if (obj.HomeDir == nil) != (res.HomeDir == nil) {
 		return fmt.Errorf("the HomeDir differs")
 	}
@@ -462,7 +497,7 @@ type UserResAutoEdges struct {
 // group to user, and if the user is absent the edge goes from user to group.
 // This ensures that we don't add users to groups that don't exist or delete
 // groups before we delete their members.
-func (obj *UserRes) AutoEdges() (engine.AutoEdge, error) {
+func (obj *UserRes) AutoEdges(ctx context.Context) (engine.AutoEdge, error) {
 	var result []engine.ResUID
 	var reversed bool
 	if obj.State == "exists" {
@@ -551,27 +586,38 @@ func (obj *UserRes) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	return nil
 }
 
-// cmpListContents is a helper to compare the list contents without pre-sorting.
-func cmpListContents(a, b []string) error {
-	if len(a) != len(b) {
-		return fmt.Errorf("lengths differ")
-	}
+// isUnknownUser reports whether err is the os/user "user not found" error.
+func isUnknownUser(err error) bool {
+	_, ok := err.(user.UnknownUserError)
+	return ok
+}
 
-	count := make(map[string]int)
+// isUnknownUserID reports whether err is the os/user "UID not found" error.
+func isUnknownUserID(err error) bool {
+	_, ok := err.(user.UnknownUserIdError)
+	return ok
+}
 
-	// Count each string in the first slice...
-	for _, s := range a {
-		count[s]++
-	}
+// userFuncs bundles the os/user, util.UserShell and engineUtil.RunCmd entry
+// points that CheckApply uses, behind func-typed fields. Shadowing `user`
+// inside CheckApply with a value of this type swaps the whole bundle at once.
+type userFuncs struct {
+	Lookup func(name string) (*user.User, error)
+	//nolint:revive // Matches os/user.LookupId.
+	LookupId func(uid string) (*user.User, error)
+	//nolint:revive // Matches os/user.LookupGroupId.
+	LookupGroupId func(gid string) (*user.Group, error)
+	GroupIds      func(u *user.User) ([]string, error)
+	Shell         func(ctx context.Context, name string) (string, error)
+	RunCmd        func(ctx context.Context, cmdName string, args []string) error
+}
 
-	// Subtract counts for the second slice, and check if any are zero.
-	for _, s := range b {
-		count[s]--
-		if count[s] < 0 {
-			return fmt.Errorf("difference: %s", s)
-		}
-	}
-
-	// If all the counts are zero, then the slices must match!
-	return nil
+// defaultUserFuncs is the production wiring of userFuncs.
+var defaultUserFuncs = userFuncs{
+	Lookup:        user.Lookup,
+	LookupId:      user.LookupId,
+	LookupGroupId: user.LookupGroupId,
+	GroupIds:      func(u *user.User) ([]string, error) { return u.GroupIds() },
+	Shell:         util.UserShell,
+	RunCmd:        engineUtil.RunCmd,
 }

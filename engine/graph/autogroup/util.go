@@ -43,28 +43,23 @@ import (
 // then by deleting v2 from the graph. Since more than one edge between two
 // vertices is not allowed, duplicate edges are merged as well. An edge merge
 // function can be provided if you'd like to control how you merge the edges!
+// The input graph must be a DAG, and the two vertices must not be reachable
+// from each other, which also guarantees that the result stays a DAG.
 func VertexMerge(g *pgraph.Graph, v1, v2 pgraph.Vertex, vertexMergeFn func(pgraph.Vertex, pgraph.Vertex) (pgraph.Vertex, error), edgeMergeFn func(pgraph.Edge, pgraph.Edge) pgraph.Edge) error {
 	// methodology
 	// 1) edges between v1 and v2 are removed
-	//Loop:
-	for k1 := range g.Adjacency() {
-		for k2 := range g.Adjacency()[k1] {
-			// v1 -> v2 || v2 -> v1
-			if (k1 == v1 && k2 == v2) || (k1 == v2 && k2 == v1) {
-				delete(g.Adjacency()[k1], k2) // delete map & edge
-				// NOTE: if we assume this is a DAG, then we can
-				// assume only v1 -> v2 OR v2 -> v1 exists, and
-				// we can break out of these loops immediately!
-				//break Loop
-				break
-			}
-		}
-	}
+	// NOTE: since this is a DAG, at most one of the two directions exists,
+	// but deleting an edge which isn't there is a cheap noop anyway.
+	g.DeleteEdgeBetween(v1, v2) // delete map & edge
+	g.DeleteEdgeBetween(v2, v1) // delete map & edge
 
 	// 2) edges that point towards v2 from X now point to v1 from X (no dupes)
 	for _, x := range g.IncomingGraphVertices(v2) { // all to vertex v (??? -> v)
 		e := g.Adjacency()[x][v2] // previous edge
-		r, err := g.Reachability(x, v1)
+		// We need the actual path here (not just a bool) to merge the
+		// edge through it below. The unsafe variant skips the redundant
+		// per-call DAG validation. Our caller guarantees a DAG.
+		r, err := g.ReachabilityUnsafe(x, v1)
 		if err != nil {
 			return err
 		}
@@ -82,19 +77,19 @@ func VertexMerge(g *pgraph.Graph, v1, v2 pgraph.Vertex, vertexMergeFn func(pgrap
 					continue
 				}
 				// this edge is from: prev, to: next
-				ex, _ := g.Adjacency()[prev][next] // get
+				ex := g.FindEdge(prev, next) // get
 				ex = edgeMergeFn(ex, e)
-				g.Adjacency()[prev][next] = ex // set
+				g.AddEdge(prev, next, ex) // set
 				prev = next
 			}
 		}
-		delete(g.Adjacency()[x], v2) // delete old edge
+		g.DeleteEdgeBetween(x, v2) // delete old edge
 	}
 
 	// 3) edges that point from v2 to X now point from v1 to X (no dupes)
 	for _, x := range g.OutgoingGraphVertices(v2) { // all from vertex v (v -> ???)
-		e := g.Adjacency()[v2][x] // previous edge
-		r, err := g.Reachability(v1, x)
+		e := g.Adjacency()[v2][x]             // previous edge
+		r, err := g.ReachabilityUnsafe(v1, x) // see note in step 2
 		if err != nil {
 			return err
 		}
@@ -112,13 +107,13 @@ func VertexMerge(g *pgraph.Graph, v1, v2 pgraph.Vertex, vertexMergeFn func(pgrap
 					continue
 				}
 				// this edge is from: prev, to: next
-				ex, _ := g.Adjacency()[prev][next]
+				ex := g.FindEdge(prev, next)
 				ex = edgeMergeFn(ex, e)
-				g.Adjacency()[prev][next] = ex
+				g.AddEdge(prev, next, ex)
 				prev = next
 			}
 		}
-		delete(g.Adjacency()[v2], x)
+		g.DeleteEdgeBetween(v2, x)
 	}
 
 	// 4) merge and then remove the (now merged/grouped) vertex
@@ -144,10 +139,12 @@ func VertexMerge(g *pgraph.Graph, v1, v2 pgraph.Vertex, vertexMergeFn func(pgrap
 	}
 	g.DeleteVertex(v2) // remove grouped vertex
 
-	// 5) creation of a cyclic graph should throw an error
-	if _, err := g.TopologicalSort(); err != nil { // am i a dag or not?
-		return errwrap.Wrapf(err, "the TopologicalSort failed") // not a dag
-	}
+	// NOTE: We used to validate acyclicity here after every single merge,
+	// with a full topological sort. That's provably unnecessary when the
+	// caller only merges mutually unreachable vertices of a DAG: any new
+	// cycle through the merged vertex would imply a pre-existing path
+	// between v1 and v2, which the viability check already excluded. The
+	// caller validates the whole result once at the end of the run.
 	return nil // success
 }
 

@@ -30,6 +30,7 @@
 package autogroup
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/purpleidea/mgmt/engine"
@@ -39,31 +40,44 @@ import (
 
 // AutoGroup is the mechanical auto group "runner" that runs the interface spec.
 // TODO: this algorithm may not be correct in all cases. replace if needed!
-func AutoGroup(ag engine.AutoGrouper, g *pgraph.Graph, debug bool, logf func(format string, v ...interface{})) error {
+func AutoGroup(ctx context.Context, ag engine.AutoGrouper, g *pgraph.Graph, debug bool, logf func(format string, v ...interface{})) error {
 	logf("algorithm: %s...", ag.Name())
 	if err := ag.Init(g); err != nil {
 		return errwrap.Wrapf(err, "error running autoGroup(init)")
 	}
 
 	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
 		var v, w pgraph.Vertex
 		v, w, err := ag.VertexNext() // get pair to compare
 		if err != nil {
 			return errwrap.Wrapf(err, "error running autoGroup(vertexNext)")
 		}
 		merged := false
-		// save names since they change during the runs
-		vStr := fmt.Sprintf("%v", v) // valid even if it is nil
-		wStr := fmt.Sprintf("%v", w)
 
 		if err := ag.VertexCmp(v, w); err != nil { // cmp ?
 			if debug {
-				logf("!GroupCmp for: %s into: %s", wStr, vStr)
+				logf("!GroupCmp for: %v into: %v", w, v)
 				logf("!GroupCmp err: %+v", err)
 			}
 
+			// does the graph shape allow this merge?
+		} else if err := ag.VertexViable(v, w); err != nil { // viable ?
+			if debug {
+				logf("!VertexViable for: %v into: %v", w, v)
+				logf("!VertexViable err: %+v", err)
+			}
+
 			// remove grouped vertex and merge edges (res is safe)
-		} else if err := VertexMerge(g, v, w, ag.VertexMerge, ag.EdgeMerge); err != nil { // merge...
+			// Almost all pairs fail the above checks, so it's only
+			// now worth saving the names, since they change during
+			// the merge and we want the originals in the messages.
+		} else if vStr, wStr, err := fmt.Sprintf("%v", v), fmt.Sprintf("%v", w), VertexMerge(g, v, w, ag.VertexMerge, ag.EdgeMerge); err != nil { // merge...
 			logf("!VertexMerge for: %s into: %s", wStr, vStr)
 			if debug {
 				logf("!VertexMerge err: %+v", err)
@@ -82,8 +96,12 @@ func AutoGroup(ag engine.AutoGrouper, g *pgraph.Graph, debug bool, logf func(for
 		}
 	}
 
-	// It would be great to ensure we didn't add any graph cycles here, but
-	// instead of checking now, we'll move the check into the main loop.
+	// Creation of a cyclic graph would be a programming error in one of the
+	// groupers, since merging mutually unreachable vertices of a DAG can't
+	// create a cycle. Validate the result once instead of after each merge.
+	if _, err := g.TopologicalSort(); err != nil { // am i a dag or not?
+		return errwrap.Wrapf(err, "the TopologicalSort failed") // not a dag
+	}
 
 	return nil
 }

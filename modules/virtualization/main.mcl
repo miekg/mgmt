@@ -127,7 +127,7 @@ class vm($name, $config) {
 	virt:builder "${filename}" {
 		hostname => $name,
 		os_version => "${distro}-${version}",
-		size => 1024*1024*1024*100, # 100G
+		size => 1024 * 1024 * 1024 * 100, # 100G
 		format => $format,
 		# TODO: What's the debian equivalent of these minimal packages?
 		packages => list.concat($base_packages, $packages),
@@ -167,11 +167,11 @@ class vm($name, $config) {
 		uri => "qemu:///session",
 		cpus => $cpus,
 		maxcpus => 8,
-		memory => 1024*1024*16, # 16G of RAM
+		memory => 1024 * 1024 * 16, # 16G of RAM
 		state => "running",
 		startup => $startup, # "enabled" or "disabled" or ""
 		transient => false,
-		boot => ["hd", ],
+		boot => ["hd"],
 		disk => [
 			struct{
 				source => $filename,

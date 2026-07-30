@@ -42,8 +42,8 @@ type vertex struct {
 }
 
 // String is a required method of the Vertex interface that we must fulfill.
-func (v *vertex) String() string {
-	return v.name
+func (obj *vertex) String() string {
+	return obj.name
 }
 
 // NV is a helper function to make testing easier. It creates a new noop vertex.
@@ -57,8 +57,8 @@ type edge struct {
 }
 
 // String is a required method of the Edge interface that we must fulfill.
-func (e *edge) String() string {
-	return e.name
+func (obj *edge) String() string {
+	return obj.name
 }
 
 // NE is a helper function to make testing easier. It creates a new noop edge.
@@ -93,13 +93,13 @@ func runGraphCmp(t *testing.T, g1, g2 *Graph) string {
 	return ""
 }
 
-func fullPrint(g *Graph) (str string) {
+func fullPrint(obj *Graph) (str string) {
 	str += "\n"
-	for v := range g.Adjacency() {
+	for v := range obj.adjacency {
 		str += fmt.Sprintf("* v: %s\n", v)
 	}
-	for v1 := range g.Adjacency() {
-		for v2, e := range g.Adjacency()[v1] {
+	for v1 := range obj.adjacency {
+		for v2, e := range obj.adjacency[v1] {
 			str += fmt.Sprintf("* e: %s -> %s # %s\n", v1, v2, e)
 		}
 	}

@@ -75,11 +75,10 @@ type HTTPServerUIInputRes struct {
 	init *engine.Init
 
 	// Path is the name of the http ui resource to group this into. If it is
-	// omitted, and there is only a single http ui resource, then it will
-	// be grouped into it automatically. If there is more than one main http
-	// ui resource being used, then the grouping behaviour is *undefined*
-	// when this is not specified, and it is not recommended to leave this
-	// blank!
+	// omitted, and there is only a single http ui resource, then it will be
+	// grouped into it automatically. If there is more than one main http ui
+	// resource being used, then the grouping behaviour is *undefined* when
+	// this is not specified, and it is not recommended to leave this blank!
 	Path string `lang:"path" yaml:"path"`
 
 	// ID is the unique id for this element. It is used in form fields and
@@ -255,9 +254,9 @@ func (obj *HTTPServerUIInputRes) SetValue(ctx context.Context, vs []string) erro
 	}
 
 	obj.mutex.Lock()
-	obj.setValue(ctx, value) // also sends an event
+	err := obj.setValue(ctx, value) // also sends an event
 	obj.mutex.Unlock()
-	return nil
+	return err
 }
 
 // setValue is the helper version where the caller must provide the mutex.
@@ -352,7 +351,9 @@ func (obj *HTTPServerUIInputRes) Watch(ctx context.Context) error {
 		return obj.worldWatch(ctx)
 	}
 
-	obj.init.Running() // when started, notify engine that we're running
+	if err := obj.init.Event(ctx); err != nil {
+		return err
+	}
 
 	// XXX: do we need to watch on obj.event for normal .Value stuff?
 
@@ -360,9 +361,7 @@ func (obj *HTTPServerUIInputRes) Watch(ctx context.Context) error {
 	case <-ctx.Done(): // closed by the engine to signal shutdown
 	}
 
-	//obj.init.Event() // notify engine of an event (this can block)
-
-	return nil
+	return ctx.Err()
 }
 
 func (obj *HTTPServerUIInputRes) localWatch(ctx context.Context) error {
@@ -374,7 +373,9 @@ func (obj *HTTPServerUIInputRes) localWatch(ctx context.Context) error {
 		return errwrap.Wrapf(err, "error during watch")
 	}
 
-	obj.init.Running() // when started, notify engine that we're running
+	if err := obj.init.Event(ctx); err != nil {
+		return err
+	}
 
 	for {
 		select {
@@ -389,13 +390,15 @@ func (obj *HTTPServerUIInputRes) localWatch(ctx context.Context) error {
 		case <-obj.event:
 
 		case <-ctx.Done(): // closed by the engine to signal shutdown
-			return nil
+			return ctx.Err()
 		}
 
 		if obj.init.Debug {
 			obj.init.Logf("event!")
 		}
-		obj.init.Event() // notify engine of an event (this can block)
+		if err := obj.init.Event(ctx); err != nil {
+			return err
+		}
 	}
 
 }
@@ -409,7 +412,9 @@ func (obj *HTTPServerUIInputRes) worldWatch(ctx context.Context) error {
 		return errwrap.Wrapf(err, "error during watch")
 	}
 
-	obj.init.Running() // when started, notify engine that we're running
+	if err := obj.init.Event(ctx); err != nil {
+		return err
+	}
 
 	for {
 		select {
@@ -427,13 +432,15 @@ func (obj *HTTPServerUIInputRes) worldWatch(ctx context.Context) error {
 		case <-obj.event:
 
 		case <-ctx.Done(): // closed by the engine to signal shutdown
-			return nil
+			return ctx.Err()
 		}
 
 		if obj.init.Debug {
 			obj.init.Logf("event!")
 		}
-		obj.init.Event() // notify engine of an event (this can block)
+		if err := obj.init.Event(ctx); err != nil {
+			return err
+		}
 	}
 
 }

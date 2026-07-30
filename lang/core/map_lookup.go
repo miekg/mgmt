@@ -31,6 +31,7 @@ package core
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/purpleidea/mgmt/lang/funcs/simple"
 	"github.com/purpleidea/mgmt/lang/types"
@@ -57,11 +58,13 @@ func init() {
 // MapLookup returns the value corresponding to the input key in the map.
 func MapLookup(ctx context.Context, input []types.Value) (types.Value, error) {
 	m := input[0].(*types.MapValue)
-	zero := m.Type().Val.New() // the zero value
+	key := input[1]
+	//zero := m.Type().Val.New() // the zero value
 
-	val, exists := m.Lookup(input[1])
+	val, exists := m.Lookup(key)
 	if !exists {
-		return zero, nil
+		//return zero, nil
+		return nil, fmt.Errorf("map key not present, want: %v in %v", key, m)
 	}
 	return val, nil
 }

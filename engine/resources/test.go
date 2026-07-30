@@ -34,6 +34,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"time"
 
 	"github.com/purpleidea/mgmt/engine"
 	"github.com/purpleidea/mgmt/engine/traits"
@@ -111,6 +112,7 @@ type TestRes struct {
 	SendValue     string    `lang:"sendvalue" yaml:"send_value"`         // what value should we send?
 	ExpectRecv    *[]string `lang:"expectrecv" yaml:"expect_recv"`       // what keys should we expect from send/recv?
 	OnlyShow      []string  `lang:"onlyshow" yaml:"only_show"`           // what values do we show?
+	WaitForError  int64     `lang:"waitforerror" yaml:"waitforerror"`    // block in check apply for this many ms then error
 
 	// TODO: add more fun properties!
 
@@ -147,15 +149,15 @@ func (obj *TestRes) Cleanup() error {
 
 // Watch is the primary listener for this resource and it outputs events.
 func (obj *TestRes) Watch(ctx context.Context) error {
-	obj.init.Running() // when started, notify engine that we're running
+	if err := obj.init.Event(ctx); err != nil {
+		return err
+	}
 
 	select {
 	case <-ctx.Done(): // closed by the engine to signal shutdown
 	}
 
-	//obj.init.Event() // notify engine of an event (this can block)
-
-	return nil
+	return ctx.Err()
 }
 
 // CheckApply method for Test resource. Does nothing, returns happy!
@@ -178,6 +180,16 @@ func (obj *TestRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 		key := format[0:strings.LastIndex(format, ":")]
 		if len(obj.OnlyShow) == 0 || util.StrInList(key, obj.OnlyShow) {
 			obj.init.Logf(format, v...)
+		}
+	}
+
+	if duration := time.Duration(obj.WaitForError) * time.Millisecond; duration > 0 {
+		select {
+		case <-time.After(duration):
+			return false, fmt.Errorf("waitforerror %.4f seconds", duration.Seconds())
+
+		case <-ctx.Done(): // comment out this case to simulate a bad res
+			return false, ctx.Err()
 		}
 	}
 
@@ -413,6 +425,9 @@ func (obj *TestRes) Cmp(r engine.Res) error {
 			return fmt.Errorf("the item at OnlyShow index %d differs", i)
 		}
 	}
+	if obj.WaitForError != res.WaitForError {
+		return fmt.Errorf("the WaitForError differs")
+	}
 
 	if obj.Comment != res.Comment {
 		return fmt.Errorf("the Comment differs")
@@ -462,6 +477,31 @@ func (obj *TestRes) Sends() interface{} {
 	return &TestSends{
 		Hello:  nil,
 		Answer: -1,
+	}
+}
+
+// Background is a worker function which is run once per resource kind as long
+// as there is at least one of that kind running in the active resource graph.
+// The worker function is the generated (returned) function that is used here.
+func (obj *TestRes) Background(handle *engine.BackgroundHandle) engine.BackgroundFunc {
+	return func(ctx context.Context, ready chan<- struct{}) error {
+		defer handle.Logf("stopped!")
+
+		close(ready) // i've started successfully
+
+		// XXX: What if we error 60 sec into running? How should this error be
+		// handled in the resource engine? I suppose everything should shutdown.
+
+		for {
+			handle.Logf("running...")
+			select {
+			case <-time.After(1 * time.Second):
+				continue
+
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
 	}
 }
 

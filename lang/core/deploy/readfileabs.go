@@ -59,6 +59,8 @@ var _ interfaces.DataFunc = &ReadFileAbsFunc{}
 // deploy. In general, you should use `deploy.readfile` instead. Please note
 // that this is different from the readfile function in the os package.
 type ReadFileAbsFunc struct {
+	interfaces.Textarea
+
 	init *interfaces.Init
 	data *interfaces.FuncData
 }
@@ -114,6 +116,8 @@ func (obj *ReadFileAbsFunc) Init(init *interfaces.Init) error {
 // function.
 func (obj *ReadFileAbsFunc) Copy() interfaces.Func {
 	return &ReadFileAbsFunc{
+		Textarea: obj.Textarea,
+
 		init: obj.init, // likely gets overwritten anyways
 		data: obj.data, // needed because we don't call SetData twice
 	}
@@ -130,9 +134,9 @@ func (obj *ReadFileAbsFunc) Call(ctx context.Context, args []types.Value) (types
 	if obj.init == nil || obj.data == nil {
 		return nil, funcs.ErrCantSpeculate
 	}
-	fs, err := obj.init.World.Fs(obj.data.FsURI) // open the remote file system
+	fs, err := obj.init.World.Fs(ctx, obj.data.FsURI) // open the remote file system
 	if err != nil {
-		return nil, errwrap.Wrapf(err, "can't load code from file system `%s`", obj.data.FsURI)
+		return nil, errwrap.Wrapf(err, "can't load data from file system `%s`", obj.data.FsURI)
 	}
 	content, err := fs.ReadFile(filename) // open the remote file system
 	// We could use it directly, but it feels like less correct.

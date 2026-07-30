@@ -62,8 +62,9 @@ func init() {
 }
 
 const (
-	// AwsPrefix is a const which gets prepended onto object names. We can only use
-	// alphanumeric chars, underscores and hyphens for sns topics and cloud watch rules.
+	// AwsPrefix is a const which gets prepended onto object names. We can
+	// only use alphanumeric chars, underscores and hyphens for sns topics
+	// and cloud watch rules.
 	AwsPrefix = "_mgmt-"
 	// Ec2Prefix is added to the names of sns and cloudwatch objects.
 	Ec2Prefix = AwsPrefix + "ec2-"
@@ -71,20 +72,25 @@ const (
 	SnsPrefix = Ec2Prefix + "sns-"
 	// SnsTopicName is the name of the sns topic created by snsMakeTopic.
 	SnsTopicName = SnsPrefix + "events"
-	// SnsSubscriptionProto is used to tell sns that the subscriber uses the http protocol.
+	// SnsSubscriptionProto is used to tell sns that the subscriber uses the
+	// http protocol.
 	// TODO: add https support
 	SnsSubscriptionProto = "http"
-	// SnsServerShutdownTimeout is the maximum number of seconds to wait for the http server to shutdown gracefully.
+	// SnsServerShutdownTimeout is the maximum number of seconds to wait for
+	// the http server to shutdown gracefully.
 	SnsServerShutdownTimeout = 30
-	// SnsPolicy is the topic attribute that defines the security policy for the topic.
+	// SnsPolicy is the topic attribute that defines the security policy for
+	// the topic.
 	SnsPolicy = "Policy"
 	// SnsPolicySid is the friendly name of the policy statement.
 	SnsPolicySid = CwePrefix + "publish"
 	// SnsPolicyEffect allows the action(s) defined in the policy statement.
 	SnsPolicyEffect = "Allow"
-	// SnsPolicyService is the cloudwatch events security principal that we are granting the permission to.
+	// SnsPolicyService is the cloudwatch events security principal that we
+	// are granting the permission to.
 	SnsPolicyService = "events.amazonaws.com"
-	// SnsPolicyAction is the specific permission we are granting in the policy.
+	// SnsPolicyAction is the specific permission we are granting in the
+	// policy.
 	SnsPolicyAction = "SNS:Publish"
 	// SnsCertURLRegex is used to make sure we only download certificates
 	// from amazon. This regex will match "https://sns.***.amazonaws.com/"
@@ -95,24 +101,30 @@ const (
 	CwePrefix = Ec2Prefix + "cw-"
 	// CweRuleName is the name of the rule created by makeCloudWatchRule.
 	CweRuleName = CwePrefix + "state"
-	// CweRuleSource describes the resource type to monitor for cloudwatch events.
+	// CweRuleSource describes the resource type to monitor for cloudwatch
+	// events.
 	CweRuleSource = "aws.ec2"
-	// CweRuleDetailType describes the specific type of events to trigger cloudwatch.
+	// CweRuleDetailType describes the specific type of events to trigger
+	// cloudwatch.
 	CweRuleDetailType = "EC2 Instance State-change Notification"
-	// CweTargetID is used to tell cloudwatch events to target the sns service.
+	// CweTargetID is used to tell cloudwatch events to target the sns
+	// service.
 	CweTargetID = "sns"
-	// CweTargetJSON is the json field that cloudwatch will send to our endpoint so we don't get more than we need.
+	// CweTargetJSON is the json field that cloudwatch will send to our
+	// endpoint so we don't get more than we need.
 	CweTargetJSON = "$.detail"
-	// AwsErrExceededWaitAttempts is the awserr.Message() that gets sent with
-	// the ResourceStateNotReady awserr.Code() when the waiters time out.
+	// AwsErrExceededWaitAttempts is the awserr.Message() that gets sent
+	// with the ResourceStateNotReady awserr.Code() when the waiters time
+	// out.
 	AwsErrExceededWaitAttempts = "exceeded wait attempts"
 	// AwsErrIncorrectInstanceState is the error returned when an action
 	// cannot be completed due to the current instance state.
 	AwsErrIncorrectInstanceState = "IncorrectInstanceState"
-	// waitTimeout is the duration in seconds of the timeout context in CheckApply.
+	// waitTimeout is the duration in seconds of the timeout context in
+	// CheckApply.
 	waitTimeout = 400
-	// nameKey is the name of the tag key that stores the instance name in ec2.Instance.
-	// in ec2.Instance
+	// nameKey is the name of the tag key that stores the instance name in
+	// ec2.Instance. in ec2.Instance
 	nameKey = "Name"
 	// nameTag is used to define the name tag.
 	nameTag = "tag:" + nameKey
@@ -198,8 +210,8 @@ type AwsEc2Res struct {
 	client *ec2.EC2 // client session for AWS API calls
 
 	snsClient *sns.SNS // client for AWS SNS API calls
-	// snsTopicArn requires looping through every topic to get,
-	// so we save it here when we create the topic instead.
+	// snsTopicArn requires looping through every topic to get, so we save
+	// it here when we create the topic instead.
 	snsTopicArn string
 
 	cweClient *cwe.CloudWatchEvents // client for AWS CloudWatchEvents API calls
@@ -449,10 +461,13 @@ func (obj *AwsEc2Res) Watch(ctx context.Context) error {
 func (obj *AwsEc2Res) longpollWatch(ctx context.Context) error {
 	// We tell the engine that we're running right away. This is not correct,
 	// but the api doesn't have a way to signal when the waiters are ready.
-	obj.init.Running() // when started, notify engine that we're running
+	if err := obj.init.Event(ctx); err != nil {
+		return err
+	}
 
 	// cancellable context used for exiting cleanly
 	innerCtx, cancel := context.WithCancel(context.TODO())
+	defer cancel()
 
 	// clean up when we're done
 	defer obj.wg.Wait()
@@ -528,10 +543,12 @@ func (obj *AwsEc2Res) longpollWatch(ctx context.Context) error {
 			}
 
 		case <-ctx.Done(): // closed by the engine to signal shutdown
-			return nil
+			return ctx.Err()
 		}
 
-		obj.init.Event() // notify engine of an event (this can block)
+		if err := obj.init.Event(ctx); err != nil {
+			return err
+		}
 	}
 }
 
@@ -550,7 +567,8 @@ func (obj *AwsEc2Res) snsWatch(ctx context.Context) error {
 	}
 	// set up the sns server
 	snsServer := &http.Server{
-		Handler: http.HandlerFunc(obj.snsPostHandler),
+		Handler:           http.HandlerFunc(obj.snsPostHandler),
+		ReadHeaderTimeout: 60 * time.Second, // safety against slowloris
 	}
 	// close the listener and shutdown the sns server when we're done
 	defer func() {
@@ -611,16 +629,20 @@ func (obj *AwsEc2Res) snsWatch(ctx context.Context) error {
 			// is confirmed, we are ready to receive events, so we
 			// can notify the engine that we're running.
 			if msg.event == awsEc2EventWatchReady {
-				obj.init.Running() // when started, notify engine that we're running
+				if err := obj.init.Event(ctx); err != nil {
+					return err
+				}
 				continue
 			}
 			obj.init.Logf("State: %v", msg.event)
 
 		case <-ctx.Done(): // closed by the engine to signal shutdown
-			return nil
+			return ctx.Err()
 		}
 
-		obj.init.Event() // notify engine of an event (this can block)
+		if err := obj.init.Event(ctx); err != nil {
+			return err
+		}
 	}
 }
 
@@ -862,7 +884,7 @@ func (obj *AwsEc2Res) snsListener(listenAddr string) (net.Listener, error) {
 
 // snsPostHandler listens for posts on the SNS Endpoint.
 func (obj *AwsEc2Res) snsPostHandler(w http.ResponseWriter, req *http.Request) {
-	if req.Method != "POST" {
+	if req.Method != http.MethodPost {
 		http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
 		return
 	}
@@ -975,6 +997,7 @@ func (obj *AwsEc2Res) snsGetCert(url string) (*x509.Certificate, error) {
 		return nil, fmt.Errorf("invalid certificate url: %s", url)
 	}
 	// download the signing certificate
+	//nolint:gosec // G107: url is validated against SnsCertURLRegex above
 	resp, err := http.Get(url)
 	if err != nil {
 		return nil, errwrap.Wrapf(err, "http get error")

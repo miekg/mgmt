@@ -27,6 +27,8 @@
 // additional permission if he deems it necessary to achieve the goals of this
 // additional permission.
 
+//go:build !root
+
 package main
 
 import (
@@ -75,7 +77,7 @@ func TestParseFuncs_WithRealFixturePackage(t *testing.T) {
 		Name:      testpkgPath,
 		Alias:     "",
 		MgmtAlias: "",
-		Exclude:   []string{"ToLower"}, // verify excludes are honored
+		Exclude:   []string{"ToLower"}, // verify excludes are honoured
 	}
 
 	funcs, err := gp.parsefuncs()

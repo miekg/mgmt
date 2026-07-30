@@ -1,0 +1,21 @@
+-- main.mcl --
+import "golang"
+import "iter"
+
+# Empty list cases: zipping anything with an empty list yields an empty list.
+$xs = [1, 2, 3]
+$ys = []
+$out1 = iter.zip($xs, $ys, func($x, $y) { $x + $y })
+
+$cs []int = []
+$ds []int = []
+$out2 = iter.zip($cs, $ds, func($x, $y) { $x + $y })
+
+$t1 = golang.template("out1: {{ . }}", $out1)
+$t2 = golang.template("out2: {{ . }}", $out2)
+
+test "${t1}" {}
+test "${t2}" {}
+-- OUTPUT --
+Vertex: test[out1: []]
+Vertex: test[out2: []]

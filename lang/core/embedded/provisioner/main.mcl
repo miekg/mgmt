@@ -49,6 +49,8 @@ $http_suffix = "http/"
 $tftp_suffix = "tftp/"
 $uefi_suffix = "uefi/"
 $kickstart_suffix = "kickstart/"
+$ipxe_iso_filename = "ipxe.iso"
+$ipxe_iso_default = "https://boot.ipxe.org/${ipxe_iso_filename}" # default download source
 
 # The base class is the core provisioner which can also spawn child classes.
 class base($config) {
@@ -57,15 +59,14 @@ class base($config) {
 	#
 	$interface_env = sys.getenv("MGMT_PROVISIONER_INTERFACE")
 	$interface_def = if $interface_env == "" {
-		"eth0"
+		net.wired_interface() # XXX: add <|> "" when it exists!
 	} else {
 		$interface_env
 	}
-	$interface = $config->interface || "${interface_def}"	# XXX: what if no interface exists?
-	#$interface = _struct_lookup_optional($config, "interface", "eth0")
+	$interface = $config->interface || "${interface_def}" # if no interface exists, we error
 
-	$http_port = $config->http_port || 4280	# using :4280 avoids needing root and isn't in /etc/services
-	$http_port_str = fmt.printf("%d", $http_port)
+	$http_port = $config->http_port || 4280 # using :4280 avoids needing root and isn't in /etc/services
+	$http_port_str = convert.int_to_str($http_port)
 
 	# if $network is the empty string, then we don't do any dhcp ourselves!
 	# if $network is the empty string, then we don't bring up the interface!
@@ -79,18 +80,22 @@ class base($config) {
 	$router_def = if sys.hasenv("MGMT_PROVISIONER_ROUTER") {
 		sys.getenv("MGMT_PROVISIONER_ROUTER")
 	} else {
-		"192.168.42.1/24"
+		if $network == "" {
+			net.interface_cidr($interface)
+		} else {
+			"192.168.42.1/24"
+		}
 	}
 	$router = $config->router || "${router_def}"
 	$router_ip = net.cidr_to_ip($router) # removes cidr suffix
 
-	$dns = $config->dns || ["8.8.8.8", "1.1.1.1",] # maybe google/cloudflare will sponsor!
+	$dns = $config->dns || ["8.8.8.8", "1.1.1.1"] # maybe google/cloudflare will sponsor!
 
 	$prefix = $config->prefix || ""
 	panic($prefix == "", "provisioner:base $prefix is empty") # panic if prefix is empty
 	panic(not golang_strings.has_suffix($prefix, "/"), "provisioner:base $prefix is not absolute")
 
-	file "${prefix}" {	# dir
+	file "${prefix}" { # dir
 		state => $const.res.file.state.exists,
 	}
 	$tftp_prefix = "${prefix}${tftp_suffix}"
@@ -105,8 +110,19 @@ class base($config) {
 
 	$syslinux_root = "/usr/share/syslinux/"
 
-	$nbp_bios = "tftp://${router_ip}/pxelinux.0"	# for bios clients
-	$nbp_uefi = "tftp://${router_ip}/uefi/shim.efi"	# for uefi clients
+	$nbp_bios = "tftp://${router_ip}/pxelinux.0" # for bios clients
+	$nbp_uefi = "tftp://${router_ip}/uefi/shim.efi" # for uefi clients
+
+	# Fetch an iPXE ISO once and serve the cached copy from the provisioner.
+	# An explicit empty source disables it. The exported $ipxe_iso is then
+	# empty too.
+	$ipxe_iso_source = $config->ipxe_iso || $ipxe_iso_default
+	$ipxe_iso_file = "${http_prefix}${ipxe_iso_filename}"
+	$ipxe_iso = if $ipxe_iso_source == "" {
+		""
+	} else {
+		"${server_base}${ipxe_iso_filename}"
+	}
 
 	#
 	#	network
@@ -114,12 +130,12 @@ class base($config) {
 	if $network != "" {
 		net "${interface}" {
 			state => $const.res.net.state.up,
-			addrs => [$router,],	# has cidr suffix
-			#gateway => "192.168.42.1",	# TODO: get upstream public gateway with new function
+			addrs => [$router], # has cidr suffix
+			#gateway => "192.168.42.1", # TODO: get upstream public gateway with new function
 
-			ip_forward => true,	# XXX: does this work?
+			ip_forward => true, # XXX: does this work?
 
-			Meta:reverse => true,	# XXX: ^C doesn't reverse atm. Fix that!
+			Meta:reverse => true, # XXX: ^C doesn't reverse atm. Fix that!
 
 			Before => Dhcp:Server[":67"], # TODO: add autoedges
 		}
@@ -129,8 +145,8 @@ class base($config) {
 	#	packages
 	#
 	# TODO: do we need "syslinux-nonlinux" ?
-	$pkgs_bios = ["syslinux",]
-	$pkgs_uefi = ["shim-x64", "grub2-efi-x64",]
+	$pkgs_bios = ["syslinux"]
+	$pkgs_uefi = ["shim-x64", "grub2-efi-x64"]
 	pkg $pkgs_bios {
 		state => "installed",
 	}
@@ -139,7 +155,7 @@ class base($config) {
 	#}
 
 	# TODO: not in F39+ it seems
-	#$pkgs_kickstart = ["fedora-kickstarts", "spin-kickstarts",]
+	#$pkgs_kickstart = ["fedora-kickstarts", "spin-kickstarts"]
 	#pkg $pkgs_kickstart {
 	#	state => "installed",
 	#}
@@ -153,16 +169,16 @@ class base($config) {
 				"tftp",
 				"dhcp",
 			],
-			ports => ["${http_port_str}/tcp",],
+			ports => ["${http_port_str}/tcp"],
 
 			state => $const.res.firewalld.state.exists,
 		}
 	}
 
-	file "${tftp_prefix}" {	# dir
+	file "${tftp_prefix}" { # dir
 		state => $const.res.file.state.exists,
 	}
-	file "${uefi_prefix}" {	# dir
+	file "${uefi_prefix}" { # dir
 		state => $const.res.file.state.exists,
 	}
 
@@ -174,7 +190,7 @@ class base($config) {
 		#root => $root, # we're running in memory without needing a root!
 		#debug => true, # XXX: print out a `tree` representation in tmp prefix for the user
 
-		Depend => Pkg[$pkgs_bios],	# hosted by tftp
+		Depend => Pkg[$pkgs_bios], # hosted by tftp
 		#Depend => Pkg[$pkgs_uefi],
 	}
 
@@ -185,8 +201,8 @@ class base($config) {
 	# XXX: should this also be part of repo too?
 	class tftp_root_file($f) {
 		#tftp:file "${f}" {	# without root slash
-		tftp:file "/${f}" {	# with root slash
-			path => $syslinux_root + $f,		# TODO: add autoedges
+		tftp:file "/${f}" { # with root slash
+			path => $syslinux_root + $f, # TODO: add autoedges
 
 			Depend => Pkg[$pkgs_bios],
 		}
@@ -204,9 +220,8 @@ class base($config) {
 		dhcp:server ":67" {
 			interface => $interface, # required for now
 			leasetime => "10m", # seems some clients refresh half way at 5m
-			dns => $dns,	# pick your own better ones!
-			routers => [$router_ip,],
-
+			dns => $dns, # pick your own better ones!
+			routers => [$router_ip],
 			serverid => $router_ip, # XXX: test automatic mode
 
 			#Depend => Net[$interface], # TODO: add autoedges
@@ -216,13 +231,35 @@ class base($config) {
 	#
 	#	http
 	#
-	file "${http_prefix}" {	# dir
+	file "${http_prefix}" { # dir
 		state => $const.res.file.state.exists,
 	}
 
 	http:server ":${http_port_str}" {
-		#address => ":${http_port_str}",	# you can override the name like this
-		#timeout => 60,		# add a timeout (seconds)
+		#address => ":${http_port_str}", # you can override the name like this
+		#timeout => 60, # add a timeout (seconds)
+	}
+
+	if $ipxe_iso_source != "" { # download it once so we have a copy
+		exec "provisioner-ipxe-iso" {
+			cmd => "/usr/bin/wget",
+			args => [
+				"--no-verbose",
+				$ipxe_iso_source,
+				"-O",
+				$ipxe_iso_file,
+			],
+			creates => $ipxe_iso_file,
+
+			Depend => File["${http_prefix}"],
+		}
+
+		http:server:file "/${ipxe_iso_filename}" {
+			path => $ipxe_iso_file,
+
+			Depend => Exec["provisioner-ipxe-iso"],
+			Before => Print["ready"],
+		}
 	}
 
 	$kickstart_http_prefix = "${http_prefix}${kickstart_suffix}"
@@ -319,19 +356,19 @@ class base:repo($config) {
 	$distroarch_release_http_prefix = "${distroarch_http_prefix}release/"
 	$distroarch_updates_http_prefix = "${distroarch_http_prefix}updates/"
 
-	file "${distroarch_tftp_prefix}" {	# dir
+	file "${distroarch_tftp_prefix}" { # dir
 		state => $const.res.file.state.exists,
 
 		#Meta:quiet => true,	# TODO
 
 		Depend => File["${tftp_prefix}"],
 	}
-	file "${distroarch_uefi_prefix}" {	# dir
+	file "${distroarch_uefi_prefix}" { # dir
 		state => $const.res.file.state.exists,
 
 		Depend => File["${uefi_prefix}"],
 	}
-	file "${distroarch_http_prefix}" {	# root http dir
+	file "${distroarch_http_prefix}" { # root http dir
 		state => $const.res.file.state.exists,
 
 		Depend => File["${http_prefix}"],
@@ -400,22 +437,22 @@ class base:repo($config) {
 	$uefi_shim = "${uefi_root}shim.efi"
 	$uefi_shimx64 = "${uefi_root}shimx64.efi"
 	tftp:file "/uefi/shim.efi" { # needs leading slash
-		path => $uefi_shim,		# TODO: add autoedges
+		path => $uefi_shim, # TODO: add autoedges
 
 		Depend => Exec["uefi-extract-${uid}"],
 	}
 	tftp:file "/uefi/shimx64.efi" { # needs leading slash
-		path => $uefi_shimx64,		# TODO: add autoedges
+		path => $uefi_shimx64, # TODO: add autoedges
 
 		Depend => Exec["uefi-extract-${uid}"],
 	}
-	tftp:file "/uefi/grubx64.efi" {	# sometimes used?
-		path => "${uefi_root}grubx64.efi",		# TODO: add autoedges
+	tftp:file "/uefi/grubx64.efi" { # sometimes used?
+		path => "${uefi_root}grubx64.efi", # TODO: add autoedges
 
 		Depend => Exec["uefi-extract-${uid}"],
 	}
-	tftp:file "grubx64.efi" {	# no leading slash
-		path => "${uefi_root}grubx64.efi",		# TODO: add autoedges
+	tftp:file "grubx64.efi" { # no leading slash
+		path => "${uefi_root}grubx64.efi", # TODO: add autoedges
 
 		Depend => Exec["uefi-extract-${uid}"],
 	}
@@ -439,12 +476,12 @@ class base:repo($config) {
 	}
 
 	tftp:file "/${uid}/vmlinuz" {
-		path => $vmlinuz_file,		# TODO: add autoedges
+		path => $vmlinuz_file, # TODO: add autoedges
 
 		#Depend => Pkg[$pkgs],
 	}
-	http:server:file "/${uid}/vmlinuz" {	# when using ipxe
-		path => $vmlinuz_file,		# TODO: add autoedges
+	http:server:file "/${uid}/vmlinuz" { # when using ipxe
+		path => $vmlinuz_file, # TODO: add autoedges
 
 		#Depend => Pkg[$pkgs],
 	}
@@ -466,12 +503,12 @@ class base:repo($config) {
 	}
 
 	tftp:file "/${uid}/initrd.img" {
-		path => $initrd_file,		# TODO: add autoedges
+		path => $initrd_file, # TODO: add autoedges
 
 		#Depend => Pkg[$pkgs],
 	}
-	http:server:file "/${uid}/initrd.img" {	# when using ipxe
-		path => $initrd_file,		# TODO: add autoedges
+	http:server:file "/${uid}/initrd.img" { # when using ipxe
+		path => $initrd_file, # TODO: add autoedges
 
 		#Depend => Pkg[$pkgs],
 	}
@@ -506,9 +543,9 @@ class base:repo($config) {
 	#$fedora_repo_template = struct{
 	#	name => "fedora",
 	#	distro => $distro,
-	#	version => $version,		# 39 for fedora 39
-	#	arch => $arch,			# could also be aarch64
-	#	#flavour => "Everything",	# The install repo uses "Everything" even for "Workstation" or "Server"
+	#	version => $version, # 39 for fedora 39
+	#	arch => $arch, # could also be aarch64
+	#	#flavour => "Everything", # The install repo uses "Everything" even for "Workstation" or "Server"
 	#	extra => "releases",
 	#
 	#	baseurl => "http://${router_ip}:${http_port_str}/fedora/releases/${version}/Everything/${arch}/os/",
@@ -516,9 +553,9 @@ class base:repo($config) {
 	#$updates_repo_template = struct{
 	#	name => "updates",
 	#	distro => $distro,
-	#	version => $version,		# 39 for fedora 39
-	#	arch => $arch,			# could also be aarch64
-	#	#flavour => "Everything",	# The install repo uses "Everything" even for "Workstation" or "Server"
+	#	version => $version, # 39 for fedora 39
+	#	arch => $arch, # could also be aarch64
+	#	#flavour => "Everything", # The install repo uses "Everything" even for "Workstation" or "Server"
 	#	extra => "updates",
 	#
 	#	baseurl => "http://${router_ip}:${http_port_str}/fedora/updates/${version}/Everything/${arch}/",
@@ -534,7 +571,7 @@ class base:repo($config) {
 	#	rsync
 	#
 	#$source_pattern = if $is_fedora {
-	#	"${rsync}releases/${version}/Everything/${arch}/os/"	# source
+	#	"${rsync}releases/${version}/Everything/${arch}/os/" # source
 	#} else {
 	#	"" # XXX: not implemented
 	#}
@@ -552,8 +589,8 @@ class base:repo($config) {
 	#			"--progress",
 	#			# This flavour must always be Everything to work.
 	#			# The Workstation flavour doesn't have an os/ dir.
-	#			$source_pattern,	# source
-	#			$distroarch_release_http_prefix,	# dest
+	#			$source_pattern, # source
+	#			$distroarch_release_http_prefix, # dest
 	#		],
 	#
 	#		# run this when cmd completes successfully
@@ -604,14 +641,14 @@ class base:host($name, $config) {
 	#}
 	#$ip = $config->ip || magic.pool($ns, [1,2,3,4], $name) # XXX: if $ns is "", then don't allocate. Otherwise get from list. Reuse based on $name hash.
 	$bios = $config->bios || false
-	$password = $config->password || ""	# empty means disabled
+	$password = $config->password || "" # empty means disabled
 	panic(len($password) != 0 and len($password) != 106, "provisioner:host $password (salted) is wrong length") # length of salted password
-	$sshkey = golang_strings.trim_space($config->sshkey || "")	# root ssh pub key to add
+	$sshkey = golang_strings.trim_space($config->sshkey || "") # root ssh pub key to add
 
-	$part = $config->part || ""	# partitioning scheme
-	$luks = $config->luks || true	# enable luks encryption
+	$part = $config->part || "" # partitioning scheme
+	$luks = $config->luks || true # enable luks encryption
 
-	$empty_list_str []str = []	# need an explicit type on empty list definition
+	$empty_list_str []str = [] # need an explicit type on empty list definition
 	$packages = $config->packages || $empty_list_str
 
 	# should we provision this host by default?
@@ -623,6 +660,7 @@ class base:host($name, $config) {
 	$handoff_module_path = $config->handoff_module_path || ""
 	$handoff_svc_sshurl = $config->handoff_svc_sshurl || ""
 	$handoff_svc_hostkey = $config->handoff_svc_hostkey || ""
+	$handoff_svc_sshid = $config->handoff_svc_sshid || ""
 	panic(($handoff_svc_sshurl != "") != ($handoff_svc_hostkey != ""), "provisioner:host $handoff_svc needs sshurl (${handoff_svc_sshurl}) and hostkey (${handoff_svc_hostkey})")
 
 	panic($handoff_code != "" and not golang_strings.has_prefix($handoff_code, "/"), "provisioner:host $handoff_code is not absolute")
@@ -637,10 +675,10 @@ class base:host($name, $config) {
 	} else {
 		$mac
 	}
-	$provision_key = $hkey	# XXX: what unique id should we use for the host? mac? name? hkey?
+	$provision_key = $hkey # XXX: what unique id should we use for the host? mac? name? hkey?
 
 	#$ret = world.getval($provision_key) # has it previously been provisioned?
-	#$val = if $ret->value == "" {	# avoid an invalid string killing the parse_bool function
+	#$val = if $ret->value == "" { # avoid an invalid string killing the parse_bool function
 	#	convert.format_bool(false) # "false"
 	#} else {
 	#	$ret->value
@@ -648,26 +686,26 @@ class base:host($name, $config) {
 	#$provision = if not $ret->exists {
 	#	$provision_default
 	#} else {
-	#	not convert.parse_bool($val)	# XXX: should an invalid string return false or error here?
+	#	not convert.parse_bool($val) # XXX: should an invalid string return false or error here?
 	#}
 	$provision = true
 
 	$nbp_path = if $bios {
-		"/pxelinux.0"		# for bios clients
+		"/pxelinux.0" # for bios clients
 	} else {
-		"/uefi/shim.efi"	# for uefi clients
+		"/uefi/shim.efi" # for uefi clients
 	}
 
 	if $network != "" {
 		if $mac != "" {
-			dhcp:host "${name}" {	# the hostname
+			dhcp:host "${name}" { # the hostname
 				mac => $mac,
-				ip => $ip,	# cidr notation is required
+				ip => $ip, # cidr notation is required
 
-				nbp => $provision ?: if $bios {	# XXX: do we want this from the base class?
-					$nbp_bios	# from base class
+				nbp => $provision ?: if $bios { # XXX: do we want this from the base class?
+					$nbp_bios # from base class
 				} else {
-					$nbp_uefi	# from base class
+					$nbp_uefi # from base class
 				},
 				nbp_path => $provision ?: $nbp_path, # with leading slash
 
@@ -678,12 +716,12 @@ class base:host($name, $config) {
 			# TODO: Our dhcp:range could send/recv a map from ip => mac address!
 			dhcp:range "${name}" {
 				network => "${network}", # eg: 192.168.42.0/24
-				skip => [$router,], # eg: 192.168.42.1/24
+				skip => [$router], # eg: 192.168.42.1/24
 
-				nbp => $provision ?: if $bios {	# XXX: do we want this from the base class?
-					$nbp_bios	# from base class
+				nbp => $provision ?: if $bios { # XXX: do we want this from the base class?
+					$nbp_bios # from base class
 				} else {
-					$nbp_uefi	# from base class
+					$nbp_uefi # from base class
 				},
 				nbp_path => $provision ?: $nbp_path, # with leading slash
 
@@ -694,9 +732,9 @@ class base:host($name, $config) {
 
 	$menu_template = struct{
 		distro => $distro,
-		version => $version,		# 39 for fedora 39
-		arch => $arch,			# could also be aarch64
-		flavour => "Everything",	# The install repo uses "Everything" even for "Workstation" or "Server"
+		version => $version, # 39 for fedora 39
+		arch => $arch, # could also be aarch64
+		flavour => "Everything", # The install repo uses "Everything" even for "Workstation" or "Server"
 
 		ks => "http://${router_ip}:${http_port_str}/fedora/kickstart/${hkey}.ks", # usually $mac or `default`
 		inst_repo_base => $inst_repo_base,
@@ -735,11 +773,11 @@ class base:host($name, $config) {
 	}
 
 	if $bios {
-		tftp:file "${bios_menu}" {	# for bios
+		tftp:file "${bios_menu}" { # for bios
 			data => golang.template(deploy.readfile("/files/bios-menu.tmpl"), $menu_template),
 		}
 	} else {
-		tftp:file "${uefi_menu}" {	# for uefi
+		tftp:file "${uefi_menu}" { # for uefi
 			# XXX: linuxefi & initrdefi VS. kernel & append ?
 			data => golang.template(deploy.readfile("/files/uefi-menu.tmpl"), $menu_template),
 
@@ -749,11 +787,11 @@ class base:host($name, $config) {
 	}
 
 	# https://<ip>:4280/${mac}.ipxe # works for ipxe scripts!
-	http:server:file "/${ipxe_menu}" {	# for ipxe
+	http:server:file "/${ipxe_menu}" { # for ipxe
 		data => golang.template(deploy.readfile("/files/ipxe-menu.tmpl"), $menu_template),
 	}
 	if $mac != "" { # generate old one but never the menu.ipxe default
-		http:server:file "/${old_mac}.ipxe" {	# for ipxe
+		http:server:file "/${old_mac}.ipxe" { # for ipxe
 			data => golang.template(deploy.readfile("/files/ipxe-menu.tmpl"), $menu_template),
 		}
 	}
@@ -839,7 +877,7 @@ class base:host($name, $config) {
 		# Setup the remote mgmt service, which starts on firstboot.
 		# NOTE: We use the short mgmt path because it's easier to pivot.
 		# XXX: read the ssh hostkey from a .known_hosts file instead
-		"${handoff_binary_path} setup svc --binary-path='mgmt' --install --enable --ssh-url='${handoff_svc_sshurl}' --ssh-hostkey='${handoff_svc_hostkey}' --seeds='http://127.0.0.1:2379'"
+		"${handoff_binary_path} setup svc --binary-path='mgmt' --install --enable --ssh-url='${handoff_svc_sshurl}' --ssh-hostkey='${handoff_svc_hostkey}' --ssh-id='${handoff_svc_sshid}' --seeds='http://127.0.0.1:2379'"
 	} else {
 		if $handoff_type == "code" {
 			# Setup the mgmt service, which starts on firstboot.
@@ -884,7 +922,8 @@ class base:host($name, $config) {
 			"fr_CA.UTF-8",
 			"en_US.UTF-8",
 		],
-		password => $password,	# salted
+		timezone => "", # XXX: not implemented
+		password => $password, # salted
 		bios => $bios,
 		part => $part,
 		luks => $luks, # set empty password
@@ -955,7 +994,7 @@ class base:host($name, $config) {
 	http:server:flag "${name}-done" {
 		key => "done",
 		path => "/action/done/mac=${provision_key}",
-		#mapped => {$str_true => $str_true, $str_false => $str_false,},
+		#mapped => {$str_true => $str_true, $str_false => $str_false},
 	}
 	http:server:flag "${name}-sshkey" {
 		key => "${sshkey_flag}",
@@ -967,7 +1006,7 @@ class base:host($name, $config) {
 		key => $provision_key,
 	}
 	value "${name}-done" {
-		#any => true,	# bool
+		#any => true, # bool
 	}
 	kv "${name}-sshkey" {
 		key => $provision_key,
@@ -1006,13 +1045,14 @@ class base:host($name, $config) {
 			state => "exists",
 
 			Meta:hidden => true,
-			Meta:export => ["*",], # TODO: get the etcd hostname?
+			Meta:export => ["*"], # TODO: get the etcd hostname?
 		}
 	}
 }
 
 class base:runner($config) {
-	$sshkey = $config->sshkey || ""
+	$sshkey = $config->sshkey || "" # pub key installed on new host
+	$sshid = $config->sshid || "" # custom private key on new host used for client auth | empty: pass all available as possible signer
 
 	$etcd_server = world.getval("provisioner_etcd_server")->value # struct{value str; exists bool}
 	if $etcd_server != "" {
@@ -1069,8 +1109,9 @@ class base:runner($config) {
 				handoff => "svc", # sets up mgmt with handoff_svc
 				handoff_svc_sshurl => $etcd_server_sshurl,
 				handoff_svc_hostkey => $etcd_server_hostkey,
+				handoff_svc_sshid => $sshid,
 				#handoff => "exec", # sets up mgmt with handoff_exec
-				#handoff_exec => "mgmt run --ssh-url='${etcd_server_sshurl}' --ssh-hostkey='${etcd_server_hostkey}' --seeds=http://127.0.0.1:2379 --no-autoedges --no-pgp empty",
+				#handoff_exec => "mgmt run --ssh-url='${etcd_server_sshurl}' --ssh-hostkey='${etcd_server_hostkey}' --ssh-id='${sshid}' --seeds=http://127.0.0.1:2379 --no-autoedges --no-autogroup --no-pgp empty",
 				#handoff_code => "/etc/mgmt/", # one way to do it
 				#handoff_module_path => "/etc/mgmt/modules/",
 				handoff_hostname => $k,

@@ -63,23 +63,25 @@ const (
 	// 'man systemd-timer', and whose format is a time span as defined in
 	// 'man systemd-time'.
 	OnBootSec = "OnBootSec"
-	// OnStartupSec is a systemd-timer trigger, whose behaviour is defined in
-	// 'man systemd-timer', and whose format is a time span as defined in
+	// OnStartupSec is a systemd-timer trigger, whose behaviour is defined
+	// in 'man systemd-timer', and whose format is a time span as defined in
 	// 'man systemd-time'.
 	OnStartupSec = "OnStartupSec"
-	// OnUnitActiveSec is a systemd-timer trigger, whose behaviour is defined
-	// in 'man systemd-timer', and whose format is a time span as defined in
-	// 'man systemd-time'.
+	// OnUnitActiveSec is a systemd-timer trigger, whose behaviour is
+	// defined in 'man systemd-timer', and whose format is a time span as
+	// defined in 'man systemd-time'.
 	OnUnitActiveSec = "OnUnitActiveSec"
-	// OnUnitInactiveSec is a systemd-timer trigger, whose behaviour is defined
-	// in 'man systemd-timer', and whose format is a time span as defined in
-	// 'man systemd-time'.
+	// OnUnitInactiveSec is a systemd-timer trigger, whose behaviour is
+	// defined in 'man systemd-timer', and whose format is a time span as
+	// defined in 'man systemd-time'.
 	OnUnitInactiveSec = "OnUnitInactiveSec"
 )
 
 func init() {
 	engine.RegisterResource("cron", func() engine.Res { return &CronRes{} })
 }
+
+var _ engine.EdgeableRes = &CronRes{} // compile time check
 
 // CronRes is a systemd-timer cron resource.
 // TODO: If we want to have an actual `crond` resource, name it LegacyCron.
@@ -181,7 +183,10 @@ func (obj *CronRes) makeComposite() (*FileRes, error) {
 	}
 	file.State = obj.State
 	if obj.State != "absent" {
-		s := obj.unitFileContents()
+		s, err := obj.unitFileContents()
+		if err != nil {
+			return nil, errwrap.Wrapf(err, "error building unit file contents")
+		}
 		file.Content = &s
 	}
 	return file, nil
@@ -298,7 +303,9 @@ func (obj *CronRes) Watch(ctx context.Context) error {
 	}
 	defer recWatcher.Close()
 
-	obj.init.Running() // when started, notify engine that we're running
+	if err := obj.init.Event(ctx); err != nil {
+		return err
+	}
 
 	for {
 		select {
@@ -313,18 +320,24 @@ func (obj *CronRes) Watch(ctx context.Context) error {
 			if !ok { // channel shutdown
 				return nil
 			}
+			if event == nil {
+				// programming error
+				return fmt.Errorf("unexpected nil recwatch event")
+			}
 			if err := event.Error; err != nil {
-				return errwrap.Wrapf(err, "Unknown %s watcher error", obj)
+				return errwrap.Wrapf(err, "unknown %s watcher error", obj)
 			}
 			if obj.init.Debug {
-				obj.init.Logf("Event(%s): %v", event.Body.Name, event.Body.Op)
+				obj.init.Logf("event(%s): %v", event.Body.Name, event.Body.Op)
 			}
 
 		case <-ctx.Done(): // closed by the engine to signal shutdown
-			return nil
+			return ctx.Err()
 		}
 
-		obj.init.Event() // notify engine of an event (this can block)
+		if err := obj.init.Event(ctx); err != nil {
+			return err
+		}
 	}
 }
 
@@ -497,7 +510,7 @@ func (obj *CronUID) IFF(uid engine.ResUID) bool {
 }
 
 // AutoEdges returns the AutoEdge interface.
-func (obj *CronRes) AutoEdges() (engine.AutoEdge, error) {
+func (obj *CronRes) AutoEdges(ctx context.Context) (engine.AutoEdge, error) {
 	return nil, nil
 }
 
@@ -560,7 +573,7 @@ func (obj *CronRes) UnitFilePath() (string, error) {
 
 // unitFileContents returns the contents of the unit file representing the
 // CronRes struct.
-func (obj *CronRes) unitFileContents() string {
+func (obj *CronRes) unitFileContents() (string, error) {
 	u := []*unit.UnitOption{}
 
 	// [Unit]
@@ -594,6 +607,8 @@ func (obj *CronRes) unitFileContents() string {
 	u = append(u, &unit.UnitOption{Section: "Install", Name: "WantedBy", Value: "timers.target"})
 
 	buf := new(bytes.Buffer)
-	buf.ReadFrom(unit.Serialize(u))
-	return buf.String()
+	if _, err := buf.ReadFrom(unit.Serialize(u)); err != nil {
+		return "", err
+	}
+	return buf.String(), nil
 }

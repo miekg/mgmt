@@ -94,8 +94,8 @@ type Metadata struct {
 	// metadata file Path settings for modules. We always search in the
 	// global path if we don't find others first. This setting defaults to
 	// false, which is important because the downloader uses it to decide
-	// where to put downloaded modules. It is similar to the equivalent of
-	// a `require vendoring` flag in golang if such a thing existed. If a
+	// where to put downloaded modules. It is similar to the equivalent of a
+	// `require vendoring` flag in golang if such a thing existed. If a
 	// module sets this to true, and specifies a Path value, then only that
 	// path will be used as long as imports are present there. Otherwise it
 	// will fall-back on the global modules directory. If a module sets this
@@ -163,8 +163,8 @@ func (obj *Metadata) ToBytes() ([]byte, error) {
 //// MarshalYAML modifies the struct before it is used to build the raw output.
 //func (obj *Metadata) MarshalYAML() (interface{}, error) {
 //	// The Marshaler interface may be implemented by types to customize
-//	// their behavior when being marshaled into a YAML document. The
-//	// returned value is marshaled in place of the original value
+//	// their behavior when being marshalled into a YAML document. The
+//	// returned value is marshal;ed in place of the original value
 //	// implementing Marshaler.
 //
 //	if obj.metadataPath == "" { // make sure metadataPath isn't saved!

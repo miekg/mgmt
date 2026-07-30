@@ -35,21 +35,25 @@ import "git://github.com/purpleidea/mgmt/modules/purpleidea/"
 import "git://github.com/purpleidea/mgmt/modules/shorewall/"
 
 class router($st) {
-	$net_dev = $st->net_dev || "eth0"
+	$net_dev = $st->net_dev || "meth0"
 	$net_mac = $st->net_mac
+	$net_ip = $st->net_ip || "" # cidr, used when not doing dhcp
+	$net_gateway = $st->net_gateway || "" # not cidr, used when not doing dhcp
 
 	#$net_uuid = $st->net_uuid || "" # 01234567-89ab-cdef-0123-456789abcdef
 
-	$loc_dev = $st->loc_dev || ""
+	$loc_dev = $st->loc_dev || "meth1"
 	$loc_mac = $st->loc_mac || ""
 
 	#$loc_uuid = $st->loc_uuid || "" # 01234567-89ab-cdef-0123-456789abcdef
 	$loc_network = $st->loc_network # cidr
+	$loc_prefix = net.cidr_to_prefix($loc_network)
 
-	$loc_ip = $st->loc_ip || net.cidr_to_first($loc_network) # no cidr
+	# XXX: loc_ip is now a cidr... can we use it figure out loc_network automatically?
+	$loc_ip = $st->loc_ip || (net.cidr_to_first($loc_network) + "/" + $loc_prefix) # cidr
 	$loc_broadcast = $st->loc_broadcast || net.cidr_to_last($loc_network)
 
-	$loc_range = $st->loc_range || struct{start => "", end => "",} # struct with start, end fields
+	$loc_range = $st->loc_range || struct{start => "", end => ""} # struct with start, end fields
 	$dns = $st->dns
 
 	$aux_dev = $st->aux_dev || ""
@@ -60,35 +64,42 @@ class router($st) {
 		startup => "disabled",
 	}
 
-	include misc.network_rename($net_mac, $net_dev)
 	if $net_dev != "" {
-		# XXX: should we specify DNS here?
-		include misc.networkd_dhcp($net_dev, struct{
-			dns => $dns,
-			metric => 50,
-		})
-		#include misc.network_manager_dhcp(struct{
-		#	uuid => $net_uuid,
-		#	dev => $net_dev,
-		#	mac => $net_mac,
-		#	dns => $dns,
-		#})
+		include misc.network_rename($net_mac, $net_dev)
+
+		if $net_ip == "" {
+			include misc.networkd_dhcp($net_dev, struct{
+				dns => $dns,
+				metric => 50,
+			})
+			#include misc.network_manager_dhcp(struct{
+			#	uuid => $net_uuid,
+			#	dev => $net_dev,
+			#	mac => $net_mac,
+			#	dns => $dns,
+			#})
+		} else {
+			include misc.networkd_static($net_dev, struct{
+				cidr => "${net_ip}", # cidr
+				gateway => "${net_gateway}", # gateway
+				dns => $dns,
+			})
+		}
 	}
 
 	if $loc_dev != "" and $loc_mac != "" {
 		include misc.network_rename($loc_mac, $loc_dev)
 	}
 	if $loc_dev != "" {
-		$prefix = net.cidr_to_prefix($loc_network)
 		include misc.networkd_static($loc_dev, struct{
-			cidr => "${loc_ip}/${prefix}",
+			cidr => "${loc_ip}", # cidr
 			#dns => $dns, # we usually don't want DNS here!
 		})
 		#include misc.network_manager_static(struct{
 		#	uuid => $loc_uuid,
 		#	dev => $loc_dev, # formerly enp0s2
 		#	mac => $loc_mac,
-		#	cidr => "${loc_ip}/${prefix}",
+		#	cidr => "${loc_ip}",
 		#	dns => $dns,
 		#})
 	}
@@ -105,12 +116,13 @@ class router($st) {
 
 	include dhcp.server(struct{
 		authoritative => true,
+		interfaces => [$loc_dev], # bonus safety
 	}) as dhcp_server # good!
 
 	include dhcp_server.subnet("loc", struct{
 		network => net.cidr_to_ip($loc_network), # network address
 		netmask => net.cidr_to_mask($loc_network), # eg: 255.255.255.0
-		router => $loc_ip, # first address
+		router => net.cidr_to_ip($loc_ip), # first address
 		broadcast => $loc_broadcast, # last address
 		range => $loc_range,
 		dns => $dns,
@@ -119,7 +131,7 @@ class router($st) {
 
 	#include dhcp_server.host("computer1", struct{
 	#	macaddress => "00:11:22:33:44:55",
-	#	fixedaddress => ["192.168.100.13",],
+	#	fixedaddress => ["192.168.100.13"],
 	#	hostname => "computer1",
 	#})
 
@@ -133,21 +145,23 @@ class router($st) {
 		include firewall.zone("aux", struct{})
 	}
 
-	# eg: eth0
-	include firewall.interface("${net_dev}", "net", struct{
-		interface => "NET_IF",	# default if not specified
-		options => [
-			"dhcp",
-			"tcpflags",
-			"nosmurfs",
-			"routefilter",
-			"sourceroute=0",
-			"logmartians",
-		],
-	})
+	# eg: meth0
+	if $net_dev != "" {
+		include firewall.interface("${net_dev}", "net", struct{
+			interface => "NET_IF", # default if not specified
+			options => [
+				"dhcp", # XXX: if $net_ip and $net_gateway does this hurt?
+				"tcpflags",
+				"nosmurfs",
+				"routefilter",
+				"sourceroute=0",
+				"logmartians",
+			],
+		})
+	}
 
 	include firewall.interface("${loc_dev}", "loc", struct{
-		interface => "LOC_IF",	# default if not specified
+		interface => "LOC_IF", # default if not specified
 		options => [
 			"dhcp",
 			"tcpflags",
@@ -162,9 +176,9 @@ class router($st) {
 	})
 
 	if $aux_dev != "" {
-		# eg: eth2
+		# eg: meth2
 		include firewall.interface("${aux_dev}", "aux", struct{
-			interface => "AUX_IF",	# default if not specified
+			interface => "AUX_IF", # default if not specified
 			options => [
 				"dhcp",
 				"tcpflags",
@@ -221,13 +235,13 @@ class router($st) {
 
 	include firewall.snat("masq-net", struct{
 		action => "MASQUERADE",
-		source => ["${loc_network}",], # ip/cidr of the LOC network, eg: 192.168.100.0/24
+		source => ["${loc_network}"], # ip/cidr of the LOC network, eg: 192.168.100.0/24
 		dest => "NET_IF",
 	})
 	if $aux_dev != "" {
 		include firewall.snat("masq-aux", struct{
 			action => "MASQUERADE",
-			source => ["${loc_network}",], # ip/cidr of the LOC network, eg: 192.168.100.0/24
+			source => ["${loc_network}"], # ip/cidr of the LOC network, eg: 192.168.100.0/24
 			dest => "AUX_IF",
 		})
 	}
@@ -255,7 +269,7 @@ class router($st) {
 		source => "loc",
 		dest => "$FW",
 		#proto => "",
-		#port => "",
+		#port => 22,
 		comment => "local administration",
 	})
 	include firewall.rule("111-accept-ssh-net-fw", struct{
@@ -263,7 +277,7 @@ class router($st) {
 		source => "net",
 		dest => "$FW",
 		#proto => "",
-		#port => "",
+		#port => 22,
 		comment => "remote administration",
 	})
 	include firewall.rule("997-drop-ping-net-fw", struct{
@@ -297,8 +311,20 @@ class router($st) {
 			source => "aux",
 			dest => "$FW",
 			#proto => "",
-			#port => "",
+			#port => 22,
 			comment => "remote administration",
+		})
+		include firewall.rule("111-accept-dns-fw-aux", struct{
+			action => "DNS(ACCEPT)",
+			source => "$FW",
+			dest => "aux",
+			comment => "Accept DNS connections from the firewall to the aux",
+		})
+		include firewall.rule("222-accept-fw-aux", struct{
+			action => "ACCEPT", # TODO: HTTP/HTTPS only?
+			source => "$FW",
+			dest => "aux",
+			comment => "Allow the firewall to make connections to the aux",
 		})
 		include firewall.rule("997-drop-ping-aux-fw", struct{
 			action => "Ping(DROP)",
@@ -313,6 +339,34 @@ class router($st) {
 			proto => "icmp",
 		})
 	}
+
+	include firewall.rule("111-accept-dns-fw-net", struct{
+		action => "DNS(ACCEPT)",
+		source => "$FW",
+		dest => "net",
+		comment => "Accept DNS connections from the firewall to the network",
+	})
+
+	include firewall.rule("222-accept-fw-net", struct{
+		action => "ACCEPT", # TODO: HTTP/HTTPS only?
+		source => "$FW",
+		dest => "net",
+		comment => "Allow the firewall to make connections to the net",
+	})
+
+	include firewall.rule("222-accept-ping-fw-loc", struct{
+		action => "Ping(ACCEPT)",
+		source => "$FW",
+		dest => "loc",
+		comment => "Allow Ping from local network to the firewall",
+	})
+	include firewall.rule("222-accept-ping-loc-fw", struct{
+		action => "Ping(ACCEPT)",
+		source => "loc",
+		dest => "$FW",
+		comment => "Allow Ping from firewall to the local network",
+	})
+
 }
 
 class router:dhcp_host($st) {
@@ -330,7 +384,7 @@ class router:dhcp_host($st) {
 
 	include dhcp_server.host("${h}", struct{
 		macaddress => "${m}",
-		fixedaddress => ["${i}",],
+		fixedaddress => ["${i}"],
 		hostname => "${h}",
 	})
 }

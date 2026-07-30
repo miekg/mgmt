@@ -45,6 +45,7 @@ import (
 	"github.com/purpleidea/mgmt/lang/funcs/vars"
 	"github.com/purpleidea/mgmt/lang/interfaces"
 	"github.com/purpleidea/mgmt/lang/types"
+	"github.com/purpleidea/mgmt/util"
 	"github.com/purpleidea/mgmt/util/errwrap"
 	"github.com/purpleidea/mgmt/util/recwatch"
 )
@@ -206,7 +207,7 @@ func (obj *GzipRes) Init(init *engine.Init) error {
 	}
 
 	// This is all stuff that's done when we're using obj.Content instead...
-	sha256sum, err := obj.hashContent(strings.NewReader(obj.Content))
+	sha256sum, err := obj.hashContent(context.Background(), strings.NewReader(obj.Content))
 	if err != nil {
 		return err
 	}
@@ -230,7 +231,7 @@ func (obj *GzipRes) Watch(ctx context.Context) error {
 	}
 	defer recWatcher.Close()
 
-	var events chan recwatch.Event
+	var events chan *recwatch.Event
 
 	if obj.Input != nil {
 		recWatcher, err := recwatch.NewRecWatcher(*obj.Input, recurse)
@@ -241,7 +242,9 @@ func (obj *GzipRes) Watch(ctx context.Context) error {
 		events = recWatcher.Events()
 	}
 
-	obj.init.Running() // when started, notify engine that we're running
+	if err := obj.init.Event(ctx); err != nil {
+		return err
+	}
 
 	for {
 		select {
@@ -251,6 +254,10 @@ func (obj *GzipRes) Watch(ctx context.Context) error {
 				// was a `return nil`, and i'm not sure why...
 				//return nil
 				return fmt.Errorf("unexpected close")
+			}
+			if event == nil {
+				// programming error
+				return fmt.Errorf("unexpected nil recwatch event")
 			}
 			if err := event.Error; err != nil {
 				return errwrap.Wrapf(err, "unknown %s watcher error", obj)
@@ -263,6 +270,10 @@ func (obj *GzipRes) Watch(ctx context.Context) error {
 			if !ok { // channel shutdown
 				return fmt.Errorf("unexpected close")
 			}
+			if event == nil {
+				// programming error
+				return fmt.Errorf("unexpected nil recwatch event")
+			}
 			if err := event.Error; err != nil {
 				return err
 			}
@@ -271,10 +282,12 @@ func (obj *GzipRes) Watch(ctx context.Context) error {
 			}
 
 		case <-ctx.Done(): // closed by the engine to signal shutdown
-			return nil
+			return ctx.Err()
 		}
 
-		obj.init.Event() // notify engine of an event (this can block)
+		if err := obj.init.Event(ctx); err != nil {
+			return err
+		}
 	}
 }
 
@@ -282,8 +295,11 @@ func (obj *GzipRes) Watch(ctx context.Context) error {
 // input is true. It returns error info and if the state check passed or not.
 // This is where we actually do the compression work when needed.
 func (obj *GzipRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 
-	h1, err := obj.hashFile(obj.getPath()) // output
+	h1, err := obj.hashFile(ctx, obj.getPath()) // output
 	if err != nil {
 		return false, err
 	}
@@ -295,7 +311,7 @@ func (obj *GzipRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 
 	i1 := obj.sha256sum
 	if obj.Input != nil {
-		h, err := obj.hashFile(*obj.Input)
+		h, err := obj.hashFile(ctx, *obj.Input)
 		if err != nil {
 			return false, err
 		}
@@ -377,14 +393,17 @@ func (obj *GzipRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 	}
 
 	// Copy the input file into the writer, which writes it out compressed.
-	count, err := io.Copy(gzipWriter, input) // dst, src
+	count, err := util.CopyContext(ctx, gzipWriter, input) // dst, src
 	if err != nil {
-		gzipWriter.Close() // Might as well always close!
+		_ = gzipWriter.Close() // Might as well always close!
 		return false, err
 	}
 
 	// NOTE: Must run this before hashing so that it includes the footer!
 	if err := gzipWriter.Close(); err != nil {
+		return false, err
+	}
+	if err := ctx.Err(); err != nil {
 		return false, err
 	}
 	sha256sum := hex.EncodeToString(hash.Sum(nil))
@@ -416,9 +435,9 @@ func (obj *GzipRes) levelPrefix() string {
 }
 
 // hashContent is a simple helper to run our hashing function.
-func (obj *GzipRes) hashContent(handle io.Reader) (string, error) {
+func (obj *GzipRes) hashContent(ctx context.Context, handle io.Reader) (string, error) {
 	hash := sha256.New()
-	if _, err := io.Copy(hash, handle); err != nil {
+	if _, err := util.CopyContext(ctx, hash, handle); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(hash.Sum(nil)), nil
@@ -426,7 +445,7 @@ func (obj *GzipRes) hashContent(handle io.Reader) (string, error) {
 
 // hashFile is a helper that returns the hash of the specified file. If the file
 // doesn't exist, it returns the empty string. Otherwise it errors.
-func (obj *GzipRes) hashFile(file string) (string, error) {
+func (obj *GzipRes) hashFile(ctx context.Context, file string) (string, error) {
 	f, err := os.Open(file) // io.Reader
 	if err != nil && !os.IsNotExist(err) {
 		// This is likely a permissions error.
@@ -440,7 +459,7 @@ func (obj *GzipRes) hashFile(file string) (string, error) {
 
 	// File exists, lets hash it!
 
-	return obj.hashContent(f)
+	return obj.hashContent(ctx, f)
 }
 
 // readHashFile reads the hashed value that we stored for the output file.

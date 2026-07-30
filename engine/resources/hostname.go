@@ -181,7 +181,9 @@ func (obj *HostnameRes) Watch(ctx context.Context) error {
 	signals := make(chan *dbus.Signal, 10) // closed by dbus package
 	bus.Signal(signals)
 
-	obj.init.Running() // when started, notify engine that we're running
+	if err := obj.init.Event(ctx); err != nil {
+		return err
+	}
 
 	for {
 		select {
@@ -195,6 +197,10 @@ func (obj *HostnameRes) Watch(ctx context.Context) error {
 			if !ok { // channel shutdown
 				return fmt.Errorf("unexpected close")
 			}
+			if event == nil {
+				// programming error
+				return fmt.Errorf("unexpected nil recwatch event")
+			}
 			if err := event.Error; err != nil {
 				return err
 			}
@@ -203,10 +209,12 @@ func (obj *HostnameRes) Watch(ctx context.Context) error {
 			}
 
 		case <-ctx.Done(): // closed by the engine to signal shutdown
-			return nil
+			return ctx.Err()
 		}
 
-		obj.init.Event() // notify engine of an event (this can block)
+		if err := obj.init.Event(ctx); err != nil {
+			return err
+		}
 	}
 }
 

@@ -157,7 +157,9 @@ func (obj *LineRes) Watch(ctx context.Context) error {
 	}
 	defer recWatcher.Close()
 
-	obj.init.Running() // when started, notify engine that we're running
+	if err := obj.init.Event(ctx); err != nil {
+		return err
+	}
 
 	for {
 		if obj.init.Debug {
@@ -169,6 +171,10 @@ func (obj *LineRes) Watch(ctx context.Context) error {
 			if !ok { // channel shutdown
 				return nil
 			}
+			if event == nil {
+				// programming error
+				return fmt.Errorf("unexpected nil recwatch event")
+			}
 			if err := event.Error; err != nil {
 				return errwrap.Wrapf(err, "unknown %s watcher error", obj)
 			}
@@ -177,10 +183,12 @@ func (obj *LineRes) Watch(ctx context.Context) error {
 			}
 
 		case <-ctx.Done(): // closed by the engine to signal shutdown
-			return nil
+			return ctx.Err()
 		}
 
-		obj.init.Event() // notify engine of an event (this can block)
+		if err := obj.init.Event(ctx); err != nil {
+			return err
+		}
 	}
 }
 
@@ -301,10 +309,12 @@ func (obj *LineRes) remove(ctx context.Context) (bool, error) {
 		fileLines = append(fileLines, scanner.Text())
 	}
 	if err := scanner.Err(); err != nil {
-		file.Close() // don't leak
+		_ = file.Close() // don't leak
 		return false, err
 	}
-	file.Close() // close before we eventually write
+	if err := file.Close(); err != nil { // close before we eventually write
+		return false, err
+	}
 
 	// check if the last line ends with a newline
 	nl := ""

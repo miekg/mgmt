@@ -32,14 +32,12 @@ package resources
 import (
 	"context"
 	"fmt"
-	"io"
-	"os/exec"
 	"os/user"
 	"strconv"
-	"syscall"
 
 	"github.com/purpleidea/mgmt/engine"
 	"github.com/purpleidea/mgmt/engine/traits"
+	engineUtil "github.com/purpleidea/mgmt/engine/util"
 	"github.com/purpleidea/mgmt/util"
 	"github.com/purpleidea/mgmt/util/errwrap"
 	"github.com/purpleidea/mgmt/util/recwatch"
@@ -49,7 +47,7 @@ func init() {
 	engine.RegisterResource("group", func() engine.Res { return &GroupRes{} })
 }
 
-const groupFile = "/etc/group"
+var _ engine.EdgeableRes = &GroupRes{} // compile time check
 
 // GroupRes is a user group resource.
 type GroupRes struct {
@@ -97,17 +95,19 @@ func (obj *GroupRes) Cleanup() error {
 
 // Watch is the primary listener for this resource and it outputs events.
 func (obj *GroupRes) Watch(ctx context.Context) error {
-	recWatcher, err := recwatch.NewRecWatcher(groupFile, false)
+	recWatcher, err := recwatch.NewRecWatcher(util.EtcGroupFile, false)
 	if err != nil {
 		return err
 	}
 	defer recWatcher.Close()
 
-	obj.init.Running() // when started, notify engine that we're running
+	if err := obj.init.Event(ctx); err != nil {
+		return err
+	}
 
 	for {
 		if obj.init.Debug {
-			obj.init.Logf("Watching: %s", groupFile) // attempting to watch...
+			obj.init.Logf("watching: %s", util.EtcGroupFile) // attempting to watch...
 		}
 
 		select {
@@ -115,28 +115,36 @@ func (obj *GroupRes) Watch(ctx context.Context) error {
 			if !ok { // channel shutdown
 				return nil
 			}
+			if event == nil {
+				// programming error
+				return fmt.Errorf("unexpected nil recwatch event")
+			}
 			if err := event.Error; err != nil {
-				return errwrap.Wrapf(err, "Unknown %s watcher error", obj)
+				return errwrap.Wrapf(err, "unknown %s watcher error", obj)
 			}
 			if obj.init.Debug { // don't access event.Body if event.Error isn't nil
-				obj.init.Logf("Event(%s): %v", event.Body.Name, event.Body.Op)
+				obj.init.Logf("event(%s): %v", event.Body.Name, event.Body.Op)
 			}
 
 		case <-ctx.Done(): // closed by the engine to signal shutdown
-			return nil
+			return ctx.Err()
 		}
 
-		obj.init.Event() // notify engine of an event (this can block)
+		if err := obj.init.Event(ctx); err != nil {
+			return err
+		}
 	}
 }
 
 // CheckApply method for Group resource.
 func (obj *GroupRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
+	user := defaultGroupFuncs // shadows os/user inside this function
+
 	// check if the group exists
 	exists := true
 	group, err := user.LookupGroup(obj.Name())
 	if err != nil {
-		if _, ok := err.(user.UnknownGroupError); !ok {
+		if !isUnknownGroup(err) {
 			return false, errwrap.Wrapf(err, "error looking up group")
 		}
 		exists = false
@@ -149,31 +157,32 @@ func (obj *GroupRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 	if obj.State == "exists" && exists && obj.GID == nil {
 		return true, nil
 	}
-	if exists && obj.GID != nil {
-		// check if GID is taken
+	// Only enforce GID uniqueness when we plan to create or modify the
+	// group. For state=absent with a missing group we returned above and
+	// for state=absent with an existing group, we're about to delete it, so
+	// a clash on the (about-to-be-released) GID is not our concern.
+	if obj.State == "exists" && obj.GID != nil {
+		// check if the GID is already taken by a different group
 		lookupGID, err := user.LookupGroupId(strconv.Itoa(int(*obj.GID)))
-		if err != nil {
-			if _, ok := err.(user.UnknownGroupIdError); !ok {
-				return false, errwrap.Wrapf(err, "error looking up GID")
-			}
+		if err != nil && !isUnknownGroupID(err) {
+			return false, errwrap.Wrapf(err, "error looking up GID")
 		}
-		if lookupGID != nil && lookupGID.Name != obj.Name() {
+		if err == nil && lookupGID.Name != obj.Name() {
 			return false, fmt.Errorf("the requested GID belongs to another group")
 		}
-		// get the existing group's GID
+	}
+	// if the group already exists, compare its GID with the one we want
+	if obj.State == "exists" && exists && obj.GID != nil {
 		existingGID, err := strconv.ParseUint(group.Gid, 10, 32)
 		if err != nil {
 			return false, errwrap.Wrapf(err, "error casting existing GID")
 		}
-		// check if existing group has the wrong GID
-		// if it is wrong groupmod will change it to the desired value
-		if *obj.GID != uint32(existingGID) {
-			obj.init.Logf("Inconsistent GID: %s", obj.Name())
-		}
 		// if the group exists and has the correct GID, we are done
-		if obj.State == "exists" && *obj.GID == uint32(existingGID) {
+		if *obj.GID == uint32(existingGID) {
 			return true, nil
 		}
+		// otherwise groupmod will change it to the desired value
+		obj.init.Logf("Inconsistent GID: %s", obj.Name())
 	}
 
 	if !apply {
@@ -181,7 +190,7 @@ func (obj *GroupRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 	}
 
 	var cmdName string
-	args := []string{obj.Name()}
+	var args []string
 
 	if obj.State == "exists" {
 		if exists {
@@ -192,7 +201,7 @@ func (obj *GroupRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 			cmdName = "groupadd"
 		}
 		if obj.GID != nil {
-			args = append(args, "-g", fmt.Sprintf("%d", *obj.GID))
+			args = append(args, "-g", strconv.FormatUint(uint64(*obj.GID), 10))
 		}
 	}
 	if obj.State == "absent" && exists {
@@ -200,30 +209,10 @@ func (obj *GroupRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 		cmdName = "groupdel"
 	}
 
-	cmd := exec.CommandContext(ctx, cmdName, args...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setpgid: true,
-		Pgid:    0,
-	}
+	args = append(args, obj.Name())
 
-	// open a pipe to get error messages from os/exec
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return false, errwrap.Wrapf(err, "failed to initialize stderr pipe")
-	}
-
-	// start the command
-	if err := cmd.Start(); err != nil {
-		return false, errwrap.Wrapf(err, "cmd failed to start")
-	}
-	// capture any error messages
-	slurp, err := io.ReadAll(stderr)
-	if err != nil {
-		return false, errwrap.Wrapf(err, "error slurping error message")
-	}
-	// wait until cmd exits and return error message if any
-	if err := cmd.Wait(); err != nil {
-		return false, errwrap.Wrapf(err, "%s", slurp)
+	if err := user.RunCmd(ctx, cmdName, args); err != nil {
+		return false, err
 	}
 
 	return false, nil
@@ -259,7 +248,7 @@ type GroupUID struct {
 }
 
 // AutoEdges returns the AutoEdge interface.
-func (obj *GroupRes) AutoEdges() (engine.AutoEdge, error) {
+func (obj *GroupRes) AutoEdges(ctx context.Context) (engine.AutoEdge, error) {
 	return nil, nil
 }
 
@@ -311,4 +300,35 @@ func (obj *GroupRes) UnmarshalYAML(unmarshal func(interface{}) error) error {
 
 	*obj = GroupRes(raw) // restore from indirection with type conversion!
 	return nil
+}
+
+// isUnknownGroup reports whether err is the os/user "group not found" error.
+func isUnknownGroup(err error) bool {
+	_, ok := err.(user.UnknownGroupError)
+	return ok
+}
+
+// isUnknownGroupID reports whether err is the os/user "GID not found" error.
+func isUnknownGroupID(err error) bool {
+	_, ok := err.(user.UnknownGroupIdError)
+	return ok
+}
+
+// groupFuncs bundles the os/user and command-runner entry points that
+// CheckApply uses, behind func-typed fields. Shadowing `user` inside CheckApply
+// with a value of this type swaps the whole bundle at once, which lets tests
+// serve lookups from memory and capture the command that would be run.
+type groupFuncs struct {
+	LookupGroup func(name string) (*user.Group, error)
+	//nolint:revive // Matches os/user.LookupGroupId.
+	LookupGroupId func(gid string) (*user.Group, error)
+	RunCmd        func(ctx context.Context, cmdName string, args []string) error
+}
+
+// defaultGroupFuncs is the production wiring of groupFuncs. RunCmd reuses the
+// stderr-capturing exec helper from the engine util library.
+var defaultGroupFuncs = groupFuncs{
+	LookupGroup:   user.LookupGroup,
+	LookupGroupId: user.LookupGroupId,
+	RunCmd:        engineUtil.RunCmd,
 }

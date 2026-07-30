@@ -38,6 +38,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -81,6 +82,8 @@ const (
 var (
 	testMutex   *sync.Mutex     // guards testCounter
 	testCounter map[string]uint // counts how many times each test ran
+
+	testMemoryAddressRegexp = regexp.MustCompile(`0x[0-9a-f]+`)
 )
 
 func init() {
@@ -207,11 +210,11 @@ func TestAstFunc1(t *testing.T) {
 
 				name := filepath.Join(tmpdir, file.Name)
 				dir := filepath.Dir(name)
-				if err := os.MkdirAll(dir, 0770); err != nil {
+				if err := os.MkdirAll(dir, 0750); err != nil {
 					t.Errorf("err making dir(%s): %+v", dir, err)
 					return
 				}
-				if err := os.WriteFile(name, file.Data, 0660); err != nil {
+				if err := os.WriteFile(name, file.Data, 0600); err != nil {
 					t.Errorf("err writing file(%s): %+v", name, err)
 					return
 				}
@@ -737,11 +740,11 @@ func TestAstFunc2(t *testing.T) {
 
 				name := filepath.Join(tmpdir, file.Name)
 				dir := filepath.Dir(name)
-				if err := os.MkdirAll(dir, 0770); err != nil {
+				if err := os.MkdirAll(dir, 0750); err != nil {
 					t.Errorf("err making dir(%s): %+v", dir, err)
 					return
 				}
-				if err := os.WriteFile(name, file.Data, 0660); err != nil {
+				if err := os.WriteFile(name, file.Data, 0600); err != nil {
 					t.Errorf("err writing file(%s): %+v", name, err)
 					return
 				}
@@ -867,9 +870,43 @@ func TestAstFunc2(t *testing.T) {
 				}
 				return false // unexpected
 			}
+			foundStreamErr := func(s string) bool {
+				const nilPtr = "0x0000000000"
+
+				for _, x := range expstrs {
+					if x == s {
+						return true // matched!
+					}
+					if !strings.Contains(x, nilPtr) {
+						continue
+					}
+					if x == testMemoryAddressRegexp.ReplaceAllString(s, nilPtr) {
+						return true // matched!
+					}
+				}
+				return false // unexpected
+			}
 
 			fail := errStr != ""
 			expstr = strings.Trim(expstr, "\n")
+
+			logCache := "" // save for comparing logs in tests
+			logCacher := func(format string, v ...interface{}) {
+				logCache += fmt.Sprintf(format, v...) + "\n"
+			}
+			expFilter := func(expstr string) string {
+				parts := strings.SplitN(expstr, "\n", 2)
+				if len(parts) == 1 {
+					return ""
+				}
+				var filtered []string
+				for _, line := range strings.Split(parts[1], "\n") {
+					if !strings.HasPrefix(line, magicError) {
+						filtered = append(filtered, line)
+					}
+				}
+				return strings.Join(filtered, "\n")
+			}
 
 			t.Logf("\n\ntest #%d (%s) ----------------\npath: %s\n\n", index, name, src)
 
@@ -1015,6 +1052,7 @@ func TestAstFunc2(t *testing.T) {
 			}
 			importGraph.AddVertex(importVertex)
 
+			logCache = "" // reset
 			data := &interfaces.Data{
 				// TODO: add missing fields here if/when needed
 				Fs:       output.FS, // formerly: fs
@@ -1032,6 +1070,7 @@ func TestAstFunc2(t *testing.T) {
 				Debug: testing.Verbose(), // set via the -test.v flag to `go test`
 				Logf: func(format string, v ...interface{}) {
 					logf("ast: "+format, v...)
+					logCacher(format, v...) // cache a copy
 				},
 			}
 			// some of this might happen *after* interpolate in SetScope or Unify...
@@ -1094,6 +1133,13 @@ func TestAstFunc2(t *testing.T) {
 					t.Logf("test #%d: err: %s", index, s)
 					t.Logf("test #%d: exp: %s", index, expstr)
 				}
+
+				// multiline error matching from logf
+				if s := expFilter(expstr); s != "" && !strings.Contains(logCache, s) {
+					t.Errorf("test #%d: err:\n%s", index, logCache)
+					t.Errorf("test #%d: exp:\n%s", index, s)
+				}
+
 				return // fail happened during set scope, don't run unification!
 			}
 			if failSetScope && err == nil {
@@ -1127,9 +1173,11 @@ func TestAstFunc2(t *testing.T) {
 				}
 			}
 
+			logCache = "" // reset
 			// apply type unification
 			xlogf := func(format string, v ...interface{}) {
 				logf("unification: "+format, v...)
+				logCacher(format, v...) // cache a copy
 			}
 			solver, err := unification.LookupDefault()
 			if err != nil {
@@ -1158,6 +1206,13 @@ func TestAstFunc2(t *testing.T) {
 					t.Logf("test #%d: err: %s", index, s)
 					t.Logf("test #%d: exp: %s", index, expstr)
 				}
+
+				// multiline error matching from logf
+				if s := expFilter(expstr); s != "" && !strings.Contains(logCache, s) {
+					t.Errorf("test #%d: err:\n%s", index, logCache)
+					t.Errorf("test #%d: exp:\n%s", index, s)
+				}
+
 				return // fail happened during unification, don't run Graph!
 			}
 			if failUnify && err == nil {
@@ -1240,6 +1295,7 @@ func TestAstFunc2(t *testing.T) {
 				}
 			}
 
+			logCache = "" // reset
 			// run the function engine once to get some real output
 			funcs := &dage.Engine{
 				Name:     "test",
@@ -1250,6 +1306,7 @@ func TestAstFunc2(t *testing.T) {
 				Debug: testing.Verbose(), // set via the -test.v flag to `go test`
 				Logf: func(format string, v ...interface{}) {
 					logf("funcs: "+format, v...)
+					logCacher(format, v...) // cache a copy
 				},
 			}
 
@@ -1312,14 +1369,20 @@ func TestAstFunc2(t *testing.T) {
 				}
 				if failStream && err != nil {
 					t.Logf("test #%d: stream errored: %+v", index, err)
-					// Stream errors often have pointers in them, so don't compare for now.
-					//s := err.Error() // convert to string
-					//if !foundErr(s) {
-					//	t.Errorf("test #%d: FAIL", index)
-					//	t.Errorf("test #%d: expected different error", index)
-					//	t.Logf("test #%d: err: %s", index, s)
-					//	t.Logf("test #%d: exp: %s", index, expstr)
-					//}
+					s := err.Error() // convert to string
+					if !foundStreamErr(s) {
+						t.Errorf("test #%d: FAIL", index)
+						t.Errorf("test #%d: expected different error", index)
+						t.Logf("test #%d: err: %s", index, s)
+						t.Logf("test #%d: exp: %s", index, expstr)
+					}
+
+					// multiline error matching from logf
+					if s := expFilter(expstr); s != "" && !strings.Contains(logCache, s) {
+						t.Errorf("test #%d: err:\n%s", index, logCache)
+						t.Errorf("test #%d: exp:\n%s", index, s)
+					}
+
 					return
 				}
 				if failStream && err == nil {
@@ -1421,7 +1484,7 @@ func TestAstFunc2(t *testing.T) {
 			}
 
 			// add automatic edges...
-			err = autoedge.AutoEdge(ograph, testing.Verbose(), logf)
+			err = autoedge.AutoEdge(context.TODO(), ograph, testing.Verbose(), logf)
 			if (!fail || !failAutoEdge) && err != nil {
 				t.Errorf("test #%d: FAIL", index)
 				t.Errorf("test #%d: automatic edges failed with: %+v", index, err)
@@ -1613,11 +1676,11 @@ func TestAstFunc3(t *testing.T) {
 
 				name := filepath.Join(tmpdir, file.Name)
 				dir := filepath.Dir(name)
-				if err := os.MkdirAll(dir, 0770); err != nil {
+				if err := os.MkdirAll(dir, 0750); err != nil {
 					t.Errorf("err making dir(%s): %+v", dir, err)
 					return
 				}
-				if err := os.WriteFile(name, file.Data, 0660); err != nil {
+				if err := os.WriteFile(name, file.Data, 0600); err != nil {
 					t.Errorf("err writing file(%s): %+v", name, err)
 					return
 				}
@@ -2287,7 +2350,7 @@ func TestAstFunc3(t *testing.T) {
 
 			// add automatic edges...
 			// TODO: use ge.AutoEdge() instead?
-			err = autoedge.AutoEdge(ograph, testing.Verbose(), logf)
+			err = autoedge.AutoEdge(context.TODO(), ograph, testing.Verbose(), logf)
 			if (!fail || !failAutoEdge) && err != nil {
 				t.Errorf("test #%d: FAIL", index)
 				t.Errorf("test #%d: automatic edges failed with: %+v", index, err)
@@ -2316,26 +2379,43 @@ func TestAstFunc3(t *testing.T) {
 			t.Logf("test #%d: graph: %+v", index, ograph)
 
 			// setup converger
-			convergedTimeout := 5
-			converger := converger.New(
-				convergedTimeout,
-			)
-			converged := make(chan struct{})
-			converger.AddStateFn("converged-exit", func(isConverged bool) error {
+			convergerTimeout := 5
+			converged, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			stateFns := converger.StateFns{}
+			stateFns["converged-exit"] = func(ctx context.Context, isConverged bool) error {
 				if isConverged {
-					logf("converged for %d seconds, exiting!", convergedTimeout)
-					close(converged) // trigger an exit!
+					logf("converged for %d seconds, exiting!", convergerTimeout)
+					cancel() // trigger an exit!
 				}
 				return nil
-			})
+			}
+
+			converger := &converger.Coordinator{
+				Timeout:  convergerTimeout,
+				StateFns: stateFns,
+
+				Debug: testing.Verbose(),
+				Logf: func(format string, v ...interface{}) {
+					logf("converger: "+format, v...)
+				},
+			}
+			if err := converger.Init(); err != nil {
+				t.Errorf("test #%d: FAIL", index)
+				t.Errorf("test #%d: can't init converger", index)
+				return
+			}
+
+			convergerCtx, convergerCancel := context.WithCancel(context.Background())
+			defer convergerCancel()
 
 			// TODO: waitgroup ?
-			go converger.Run(true) // main loop for converger, true to start paused
-			converger.Ready()      // block until ready
-			defer func() {
-				// TODO: shutdown converger, but make sure that using it in a
-				// still running embdEtcd struct doesn't block waiting on it...
-				converger.Shutdown()
+			go func() {
+				err := converger.Run(convergerCtx, false) // true to start paused
+				if err == nil || err == context.Canceled {
+					return
+				}
+				t.Errorf("converger run failed: %+v", err)
 			}()
 
 			// run engine a bit so that send/recv happens
@@ -2400,7 +2480,7 @@ func TestAstFunc3(t *testing.T) {
 
 			// XXX: can we change this into a ge.Apply operation?
 			// run autogroup; modifies the graph
-			if err := ge.AutoGroup(&autogroup.NonReachabilityGrouper{}); err != nil {
+			if err := ge.AutoGroup(context.TODO(), &autogroup.CachedNonReachabilityGrouper{}); err != nil {
 				//ge.Abort() // delete graph
 				t.Errorf("test #%d: FAIL", index)
 				t.Errorf("test #%d: error running autogrouping: %+v", index, err)
@@ -2408,8 +2488,12 @@ func TestAstFunc3(t *testing.T) {
 			}
 
 			fastPause := false
-			ge.Pause(fastPause) // sync
-			if err := ge.Commit(); err != nil {
+			if err := ge.Pause(fastPause); err != nil { // sync
+				t.Errorf("test #%d: FAIL", index)
+				t.Errorf("test #%d: error pausing: %+v", index, err)
+				return
+			}
+			if err := ge.Commit(context.Background()); err != nil {
 				t.Errorf("test #%d: FAIL", index)
 				t.Errorf("test #%d: error running commit: %+v", index, err)
 				return
@@ -2422,7 +2506,7 @@ func TestAstFunc3(t *testing.T) {
 
 			// wait for converger instead...
 			select {
-			case <-converged:
+			case <-converged.Done():
 			case <-time.After(5 * time.Second): // temporary
 
 				// XXX: add this when we debug converger
@@ -2517,7 +2601,7 @@ func overwriteTest(t *testing.T, index int, txtarFile string, archive *txtar.Arc
 		}
 	}
 	data := txtar.Format(archive)
-	if err := os.WriteFile(txtarFile, data, 0644); err != nil {
+	if err := os.WriteFile(txtarFile, data, 0600); err != nil {
 		t.Errorf("test #%d: FAIL", index)
 		t.Errorf("test #%d: error: %+v", index, err)
 		return false

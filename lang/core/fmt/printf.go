@@ -87,6 +87,8 @@ var _ interfaces.InferableFunc = &PrintfFunc{} // ensure it meets this expectati
 // we could expect the type signature to change, which is not allowed in our
 // statically typed language.
 type PrintfFunc struct {
+	interfaces.Textarea
+
 	Type *types.Type // final full type of our function
 
 	init *interfaces.Init
@@ -319,6 +321,8 @@ func (obj *PrintfFunc) Init(init *interfaces.Init) error {
 // function.
 func (obj *PrintfFunc) Copy() interfaces.Func {
 	return &PrintfFunc{
+		Textarea: obj.Textarea,
+
 		Type: obj.Type, // don't copy because we use this after unification
 
 		init: obj.init, // likely gets overwritten anyways
@@ -437,6 +441,10 @@ func parseFormatToTypeList(format string) ([]*types.Type, error) {
 			//typList = append(typList, types.TypeVariant) // old
 			typList = append(typList, types.NewType("?1")) // uni!
 
+		// type!
+		case 'T':
+			typList = append(typList, types.NewType("?1")) // uni!
+
 		default:
 			return nil, fmt.Errorf("invalid format string at %d", i)
 		}
@@ -500,6 +508,10 @@ func compileFormatToString(format string, values []types.Value) (string, error) 
 		case 'v':
 			typ = types.TypeVariant
 
+		// type!
+		case 'T':
+			typ = types.TypeVariant
+
 		default:
 			// TODO: improve the output of this
 			if !PrintfAllowFormatError {
@@ -526,7 +538,11 @@ func compileFormatToString(format string, values []types.Value) (string, error) 
 			return "", errwrap.Wrapf(err, "unexpected type")
 		}
 
-		output += valueToString(values[ix])
+		if format[i] == 'T' {
+			output += values[ix].Type().String() // print the type
+		} else {
+			output += valueToString(values[ix])
+		}
 		ix++ // consume one value
 	}
 

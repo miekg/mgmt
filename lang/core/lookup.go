@@ -39,9 +39,8 @@ import (
 )
 
 const (
-	// LookupFuncName is the name this function is registered as.
-	// This starts with an underscore so that it cannot be used from the
-	// lexer.
+	// LookupFuncName is the name this function is registered as. This
+	// starts with an underscore so that it cannot be used from the lexer.
 	LookupFuncName = funcs.LookupFuncName
 
 	// arg names...
@@ -63,6 +62,8 @@ var _ interfaces.InferableFunc = &LookupFunc{} // ensure it meets this expectati
 // TODO: Eventually we will deprecate this function when the function engine can
 // support passing a value for erroring functions. (Bad index could be an err!)
 type LookupFunc struct {
+	interfaces.Textarea
+
 	Type *types.Type // Kind == List OR Map, that is used as the list/map we lookup in
 
 	//init *interfaces.Init
@@ -197,6 +198,8 @@ func (obj *LookupFunc) Build(typ *types.Type) (*types.Type, error) {
 // function.
 func (obj *LookupFunc) Copy() interfaces.Func {
 	fn := &LookupFunc{
+		Textarea: obj.Textarea,
+
 		Type: obj.Type, // don't copy because we use this after unification
 
 		//init: obj.init, // likely gets overwritten anyways

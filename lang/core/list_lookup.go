@@ -60,7 +60,7 @@ func init() {
 func ListLookup(ctx context.Context, input []types.Value) (types.Value, error) {
 	l := input[0].(*types.ListValue)
 	index := input[1].Int()
-	zero := l.Type().Val.New() // the zero value
+	//zero := l.Type().Val.New() // the zero value
 
 	// TODO: should we handle overflow by returning zero?
 	if index > math.MaxInt { // max int size varies by arch
@@ -72,7 +72,8 @@ func ListLookup(ctx context.Context, input []types.Value) (types.Value, error) {
 
 	val, exists := l.Lookup(int(index))
 	if !exists {
-		return zero, nil
+		//return zero, nil
+		return nil, fmt.Errorf("list index not present, got: %d, len is: %d, in: %v", index, len(l.List()), l)
 	}
 	return val, nil
 }

@@ -56,9 +56,12 @@ class ssh_keygen_type($user, $type) {
 	exec "ssh-keygen-${user}" {
 		cmd => "/usr/bin/ssh-keygen",
 		args => [
-			"-t", "${type}", # type
-			"-f", "${p}.ssh/id_${type}", # private key file
-			"-N", "", # empty password
+			"-t",
+			"${type}", # type
+			"-f",
+			"${p}.ssh/id_${type}", # private key file
+			"-N",
+			"", # empty password
 		],
 		creates => "${p}.ssh/id_${type}",
 		user => $user,
@@ -87,7 +90,7 @@ class ssh_keygen_type($user, $type) {
 		content => os.readfilewait("${p}.ssh/id_${type}.pub"),
 
 		Meta:hidden => true,
-		Meta:export => ["*",],
+		Meta:export => ["*"],
 	}
 }
 
@@ -139,17 +142,16 @@ Name=${dev}
 
 # networkd_dhcp sets up a dhcp client with systemd-networkd.
 class networkd_dhcp($dev, $st) {
-	$dns = $st->dns || ["8.8.8.8",]
+	$dns = $st->dns || ["8.8.8.8"]
 	$metric = $st->metric || 100
 
-	$tmpl =
-"
+	$tmpl = "
 [Match]
 Name=${dev}
 
 [Network]
 DHCP=yes
-{{ range .dns -}}
+{{ range .Dns -}}
 DNS={{ . }}
 {{ end -}}
 #UseGateway=false
@@ -157,18 +159,19 @@ DNS={{ . }}
 [DHCP]
 UseDNS=false
 
-{{ if .metric -}}
+{{ if .Metric -}}
 [DHCPv4]
-RouteMetric={{ .metric }}
+RouteMetric={{ .Metric }}
 
 [IPv6AcceptRA]
-RouteMetric={{ .metric }}
+RouteMetric={{ .Metric }}
 {{ end -}}
 "
 
 	$args = struct{
 		#dev => $dev,
 		dns => $dns,
+		metric => $metric,
 	}
 
 	file "/etc/systemd/network/${dev}-dhcp.network" {
@@ -187,25 +190,26 @@ RouteMetric={{ .metric }}
 	}
 }
 
-# networkd_static sets up a static ip address with systemd-networkd.
+# networkd_static sets up a static ip address with systemd-networkd for local
+# or public networks.
 class networkd_static($dev, $st) {
-	$cidr = $st->cidr # cidr
-	$ip = net.cidr_to_ip($cidr)
-	$prefix = net.cidr_to_prefix($cidr)
-	#$router = $st->router || ""
-	$dns []str = $st->dns || [] # usually we don't by default!
+	$cidr = $st->cidr # cidr # the ip address in cidr format
+	$gateway = $st->gateway || ""
+	$dns []str = $st->dns || [] # we usually use this with the gateway interface
 	#$vips []str = $st->vips || [] # []cidr
 
 	#$metric = $st->metric || 50
 
-	$tmpl =
-"
+	$tmpl = "
 [Match]
 Name=${dev}
 
 [Network]
-Address=${ip}/${prefix}
-{{ range .dns -}}
+Address=${cidr}
+{{ if .Gateway -}}
+Gateway=${gateway}
+{{ end -}}
+{{ range .Dns -}}
 DNS={{ . }}
 {{ end -}}
 #UseGateway=false
@@ -221,6 +225,7 @@ Metric=1001
 
 	$args = struct{
 		#dev => $dev,
+		gateway => $gateway,
 		dns => $dns,
 	}
 
@@ -245,23 +250,22 @@ Metric=1001
 class network_manager_dhcp($st) {
 	$uuid = $st->uuid || "" # 01234567-89ab-cdef-0123-456789abcdef
 	$mac = $st->mac || ""
-	$dev = $st->dev || "eth0"
+	$dev = $st->dev || "meth0"
 
-	$dns = $st->dns || ["8.8.8.8",]
+	$dns = $st->dns || ["8.8.8.8"]
 	$dns_str = golang_strings.join($dns, ";") # the line also ends with a semicolon
-	$tmpl =
-"
+	$tmpl = "
 [connection]
 id=${dev}
-{{ if .uuid -}}
-uuid={{ .uuid }}
+{{ if .Uuid -}}
+uuid={{ .Uuid }}
 {{ end -}}
 type=ethernet
 interface-name=${dev}
 autoconnect=true
 
 [ipv4]
-{{ if .dns -}}
+{{ if .Dns -}}
 dns=${dns_str};
 {{ end -}}
 dns-search=
@@ -269,8 +273,8 @@ may-fail=false
 method=auto
 
 [ethernet]
-{{ if .mac -}}
-mac-address={{ .mac }}
+{{ if .Mac -}}
+mac-address={{ .Mac }}
 {{ end -}}
 "
 
@@ -298,39 +302,38 @@ mac-address={{ .mac }}
 class network_manager_static($st) {
 	$uuid = $st->uuid || "" # 01234567-89ab-cdef-0123-456789abcdef
 	$mac = $st->mac || ""
-	$dev = $st->dev || "eth0"
+	$dev = $st->dev || "meth0"
 	$cidr = $st->cidr # cidr
 	$ip = net.cidr_to_ip($cidr)
 	$prefix = net.cidr_to_prefix($cidr)
 	$router = $st->router || ""
-	$dns = $st->dns || ["8.8.8.8",]
+	$dns = $st->dns || ["8.8.8.8"]
 	$vips []str = $st->vips || [] # []cidr
 
 	$dns_str = golang_strings.join($dns, ";") # the line also ends with a semicolon
-	$tmpl =
-"
+	$tmpl = "
 [connection]
 id=${dev}
-{{ if .uuid -}}
-uuid={{ .uuid }}
+{{ if .Uuid -}}
+uuid={{ .Uuid }}
 {{ end -}}
 type=ethernet
 interface-name=${dev}
 autoconnect=true
 
 [ipv4]
-{{ if .router -}}
-address1=${ip}/${prefix},{{ .router }}
+{{ if .Router -}}
+address1=${ip}/${prefix},{{ .Router }}
 {{ else -}}
 address1=${ip}/${prefix}
 {{ end -}}
-{{ if .vips -}}
-{{ range $index, $ip := .vips }}
+{{ if .Vips -}}
+{{ range $index, $ip := .Vips }}
 {{ $ix := len (printf \"xx%*s\" $index \"\") -}}
 address{{ $ix }}={{ $ip }}
 {{ end -}}
 {{ end -}}
-{{ if .dns -}}
+{{ if .Dns -}}
 dns=${dns_str};
 {{ end -}}
 dns-search=
@@ -338,8 +341,8 @@ may-fail=false
 method=manual
 
 [ethernet]
-{{ if .mac -}}
-mac-address={{ .mac }}
+{{ if .Mac -}}
+mac-address={{ .Mac }}
 {{ end -}}
 "
 
@@ -373,12 +376,11 @@ class network_manager_wifi($st) {
 	$dev = $st->dev || "*" # any
 	$psk = $st->password || "" # XXX: secret!
 
-	$tmpl =
-"
+	$tmpl = "
 [connection]
 id=${name}
-{{ if .uuid -}}
-uuid={{ .uuid }}
+{{ if .Uuid -}}
+uuid={{ .Uuid }}
 {{ end -}}
 type=wifi
 #interface-name=wlp0s20f3
@@ -395,8 +397,8 @@ ssid=${ssid}
 
 [wifi-security]
 key-mgmt=wpa-psk
-{{ if .psk -}}
-psk={{ .psk }}
+{{ if .Psk -}}
+psk={{ .Psk }}
 {{ end -}}
 
 [ipv4]
@@ -469,18 +471,17 @@ class yum_repo($id, $st) {
 	$gpgkey = $st->gpgkey || ""
 
 	# `man 5 dnf.conf` for more details
-	$tmpl =
-"# generated by mgmt
+	$tmpl = "# generated by mgmt
 [${id}]
 name=${id}
 baseurl=${baseurl}
 #baseurl=http://download.example/pub/fedora/linux/updates/$releasever/Everything/$basearch/
 #metalink=https://mirrors.example.com/metalink?repo=${id}&distroversion=fedora-$releasever&arch=$basearch
 enabled=1
-{{ if .gpgkey -}}
+{{ if .Gpgkey -}}
 repo_gpgcheck=0 # TODO: enable me
 gpgcheck=1
-gpgkey={{ .gpgkey }}
+gpgkey={{ .Gpgkey }}
 #gpgkey=file:///etc/mgmt/fedora-$releasever-$basearch
 {{ end -}}
 metadata_expire=6h
@@ -522,7 +523,7 @@ class dnf_update($pkg) {
 	$args = if $pkg == "" {
 		$a
 	} else {
-		list.concat($a, ["${pkg}",]) # limit to this package only
+		list.concat($a, ["${pkg}"]) # limit to this package only
 	}
 
 	exec "${exec_name}" {
@@ -648,8 +649,52 @@ class grow($mount) {
 		],
 		creates => $done, # TODO: is there something better?
 		user => "root", # need root to be able to run normally
-		env => {"PATH" => sys.getenv("PATH"),}, # so grow can find deps
+		env => {"PATH" => sys.getenv("PATH")}, # so grow can find deps
 
 		Depend => Pkg["cloud-utils-growpart"],
+	}
+}
+
+class console($st) {
+	$dev = $st->dev || "ttyS0"
+	#$file = $st->file || "/etc/default/grub" # TODO: do we need a file param?
+
+	# This adds the console=${dev} inside the quotes if it's not present!
+	exec "console-${dev}" {
+		# sed -i '/^GRUB_CMDLINE_LINUX=/ {/console=ttyS0/! s/^\(GRUB_CMDLINE_LINUX="[^"]*\)"/\1 console=ttyS0"/}' /etc/default/grub # works!
+		cmd => "/usr/bin/sed",
+		args => [
+			"-i",
+			"/^GRUB_CMDLINE_LINUX=/ {/console=${dev}/! s/^\\(GRUB_CMDLINE_LINUX=\"[^\"]*\\)\"/\\1 console=${dev}\"/}", # works!
+			"/etc/default/grub",
+		],
+		# grep -Pq '^GRUB_CMDLINE_LINUX="(?![^"]*console=ttyS0)[^"]*"' /etc/default/grub # returns 0 if change is needed
+		ifcmd => "/usr/bin/grep -Pq ^GRUB_CMDLINE_LINUX=\"(?![^\"]*console=${dev})[^\"]*\" /etc/default/grub",
+	}
+
+	# XXX: do we need to run `stty -F /dev/ttyS0 speed 9600` ?
+
+	exec "grub2-mkconfig-${dev}" {
+		cmd => "/usr/sbin/grub2-mkconfig",
+		args => [
+			"-o",
+			"/boot/efi/EFI/fedora/grub.cfg", # formerly: /boot/grub2/grub.cfg
+		],
+		mtimes => [
+			"/etc/default/grub",
+		],
+		ifcmd => "/bin/false", # used with mtimes
+
+		# XXX: add a semaphore if we have another grub2-mkconfig somewhere?
+
+		Before => Svc["${svc}"],
+		Depend => Exec["console-${dev}"],
+	}
+
+	# XXX: historically on CentOS we would use "getty@" not "serial-getty@"
+	$svc = "serial-getty@${dev}" # .service
+	svc "${svc}" {
+		state => "running",
+		startup => "enabled",
 	}
 }

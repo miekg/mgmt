@@ -1,0 +1,19 @@
+-- main.mcl --
+import "golang"
+import "iter"
+
+# Empty inner lists are dropped; empty outer list yields the empty list.
+$lists1 = [[], ["a", "b"], [], ["c"], []]
+$out1 = iter.flatten($lists1)
+
+$lists2 [][]int = []
+$out2 = iter.flatten($lists2)
+
+$t1 = golang.template("out1: {{ . }}", $out1)
+$t2 = golang.template("out2: {{ . }}", $out2)
+
+test "${t1}" {}
+test "${t2}" {}
+-- OUTPUT --
+Vertex: test[out1: [a b c]]
+Vertex: test[out2: []]

@@ -186,6 +186,7 @@ func (obj *HTTPServerProxyRes) serveHTTP(ctx context.Context, requestPath string
 
 	// FIXME: should we be using a different client?
 	client := http.DefaultClient
+	//nolint:gosec // G704: proxyURL is rooted at the operator-configured Head; proxying to it is this resource's purpose
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, proxyURL, nil) // (*Request, error)
 	if err != nil {
 		return nil, err
@@ -201,6 +202,7 @@ func (obj *HTTPServerProxyRes) serveHTTP(ctx context.Context, requestPath string
 		// NOTE: Using this header breaks wget2!
 		//w.WriteHeader(http.StatusProcessing) // http 102, RFC 2518, 10.1
 
+		//nolint:gosec // G704: request targets the operator-configured Head; proxying to it is this resource's purpose
 		response, err := client.Do(request) // (*Response, error)
 		if err != nil {
 			return err
@@ -474,15 +476,15 @@ func (obj *HTTPServerProxyRes) Cleanup() error {
 // particular one does absolutely nothing but block until we've received a done
 // signal.
 func (obj *HTTPServerProxyRes) Watch(ctx context.Context) error {
-	obj.init.Running() // when started, notify engine that we're running
+	if err := obj.init.Event(ctx); err != nil {
+		return err
+	}
 
 	select {
 	case <-ctx.Done(): // closed by the engine to signal shutdown
 	}
 
-	//obj.init.Event() // notify engine of an event (this can block)
-
-	return nil
+	return ctx.Err()
 }
 
 // CheckApply never has anything to do for this resource, so it always succeeds.

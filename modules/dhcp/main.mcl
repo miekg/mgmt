@@ -35,11 +35,16 @@ import "golang/strings" as golang_strings
 import "os"
 
 class server($st) {
+	$interfaces []str = $st->interfaces || []
 	$authoritative = $st->authoritative || true
 	$defaultleasetime = $st->defaultleasetime || 600
 	$maxleasetime = $st->maxleasetime || 7200
 
 	$tmpl = struct{
+		domain => "", # XXX: not implemented
+		dns => "", # XXX: not implemented (switch to list?)
+		omapiport => "", # XXX: not implemented
+		serveridentifier => "", # XXX: not implemented
 		defaultleasetime => $defaultleasetime,
 		maxleasetime => $maxleasetime,
 		authoritative => $authoritative,
@@ -79,6 +84,20 @@ class server($st) {
 		Notify => Svc["dhcpd"],
 
 		Depend => File["/etc/dhcp/"],
+	}
+
+	$sysconfig_tmpl = struct{
+		interfaces => $interfaces,
+	}
+	file "/etc/sysconfig/dhcpd" { # not officially used anymore
+		state => $const.res.file.state.exists,
+		content => golang.template(deploy.readfile("/files/dhcpd.tmpl"), $sysconfig_tmpl),
+		owner => "root",
+		group => "root",
+		mode => "u=rw,go=r",
+
+		Notify => Svc["dhcpd"],
+		Depend => Pkg["${pkg}"],
 	}
 
 	svc "dhcpd" {
@@ -137,9 +156,10 @@ class server:subnet($name, $st) {
 	$broadcast = $st->broadcast || ""
 	$router = $st->router || "" # TODO: eventually this could be a list
 	$dns = $st->dns || [] # []str, local 'option domain-name-servers'
-	$range = $st->range || struct{start => "", end => "",} # struct with start, end fields
+	$range = $st->range || struct{start => "", end => ""} # struct with start, end fields
 	$range_start = $range->start || ""
 	$range_end = $range->end || ""
+	$nextserver = $st->nextserver || ""
 
 	$comment = $st->comment || ""
 
@@ -157,7 +177,11 @@ class server:subnet($name, $st) {
 		router => "${router}", # TODO: support multiple
 		dns => golang_strings.join($dns, ", "),
 		range => $valid_range,
-		#nextserver => "${nextserver}",
+		nextserver => "${nextserver}",
+		filename => "", # XXX: not implemented
+		serveridentifier => "", # XXX: not implemented
+		defaultleasetime => "", # XXX: not implemented
+		maxleasetime => "", # XXX: not implemented
 		#filename => "${filename}",
 		comment => "${comment}",
 	}
@@ -191,7 +215,6 @@ class server:host_base() {
 		group => "root",
 		mode => "u=rw,go=",
 	}
-
 
 	file "/etc/dhcp/hosts.conf" {
 		state => $const.res.file.state.exists,

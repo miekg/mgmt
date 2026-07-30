@@ -266,7 +266,7 @@ func (obj *Cluster) Quit(ctx context.Context) error {
 		if !ok {
 			return false // not what we're looking for
 		}
-		if !wStatus.Signaled() {
+		if !wStatus.Signaled() { //nolint:misspell // golang stdlib name
 			return false // not a timeout or cancel (no signal)
 		}
 		sig := wStatus.Signal()
@@ -292,6 +292,16 @@ func (obj *Cluster) Quit(ctx context.Context) error {
 // Remember to leave a longer timeout when using a context since this will have
 // to call wait on each member individually.
 func (obj *Cluster) Wait(ctx context.Context) error {
+	return obj.wait(ctx, false)
+}
+
+// WaitForConvergedAfterActivity waits until each cluster member has converged
+// after seeing activity.
+func (obj *Cluster) WaitForConvergedAfterActivity(ctx context.Context) error {
+	return obj.wait(ctx, true)
+}
+
+func (obj *Cluster) wait(ctx context.Context, requireActivity bool) error {
 	var err error
 	// TODO: not implemented
 	//if obj.Etcd {
@@ -305,6 +315,10 @@ func (obj *Cluster) Wait(ctx context.Context) error {
 		// TODO: do we want individual waits?
 		//ctx, cancel := context.WithTimeout(context.Background(), longTimeout*time.Second)
 		//defer cancel()
+		if requireActivity {
+			err = errwrap.Append(err, instance.WaitForConvergedAfterActivity(ctx))
+			continue
+		}
 		err = errwrap.Append(err, instance.Wait(ctx))
 	}
 	return err

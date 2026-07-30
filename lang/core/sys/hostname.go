@@ -45,8 +45,7 @@ import (
 )
 
 const (
-	// HostnameFuncName is the name this fact is registered as. It's still a
-	// Func Name because this is the name space the fact is actually using.
+	// HostnameFuncName is the name this func is registered as.
 	HostnameFuncName = "hostname"
 
 	hostname1Path       = "/org/freedesktop/hostname1"
@@ -55,16 +54,18 @@ const (
 )
 
 func init() {
-	funcs.ModuleRegister(ModuleName, HostnameFuncName, func() interfaces.Func { return &Hostname{} }) // must register the fact and name
+	funcs.ModuleRegister(ModuleName, HostnameFuncName, func() interfaces.Func { return &Hostname{} })
 }
 
 // Hostname is a function that returns the hostname.
 // TODO: support hostnames that change in the future.
 type Hostname struct {
+	interfaces.Textarea
+
 	init *interfaces.Init
 }
 
-// String returns a simple name for this fact. This is needed so this struct can
+// String returns a simple name for this func. This is needed so this struct can
 // satisfy the pgraph.Vertex interface.
 func (obj *Hostname) String() string {
 	return HostnameFuncName
@@ -78,7 +79,7 @@ func (obj *Hostname) Validate() error {
 // Info returns some static info about itself.
 func (obj *Hostname) Info() *interfaces.Info {
 	return &interfaces.Info{
-		Pure: false, // non-constant facts can't be pure!
+		Pure: false, // non-constant funcs can't be pure!
 		Memo: false,
 		Fast: false,
 		Spec: false,
@@ -86,13 +87,13 @@ func (obj *Hostname) Info() *interfaces.Info {
 	}
 }
 
-// Init runs some startup code for this fact.
+// Init runs some startup code for this func.
 func (obj *Hostname) Init(init *interfaces.Init) error {
 	obj.init = init
 	return nil
 }
 
-// Stream returns the single value that this fact has, and then closes.
+// Stream returns the single value that this func has, and then closes.
 func (obj *Hostname) Stream(ctx context.Context) error {
 	recurse := false // single file
 	recWatcher, err := recwatch.NewRecWatcher("/etc/hostname", recurse)
@@ -139,6 +140,10 @@ func (obj *Hostname) Stream(ctx context.Context) error {
 		case event, ok := <-recWatcher.Events():
 			if !ok { // channel shutdown
 				return fmt.Errorf("unexpected close")
+			}
+			if event == nil {
+				// programming error
+				return fmt.Errorf("unexpected nil recwatch event")
 			}
 			if err := event.Error; err != nil {
 				return err

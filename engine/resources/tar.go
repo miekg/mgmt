@@ -46,6 +46,7 @@ import (
 	"github.com/purpleidea/mgmt/lang/funcs/vars"
 	"github.com/purpleidea/mgmt/lang/interfaces"
 	"github.com/purpleidea/mgmt/lang/types"
+	"github.com/purpleidea/mgmt/util"
 	"github.com/purpleidea/mgmt/util/errwrap"
 	"github.com/purpleidea/mgmt/util/recwatch"
 )
@@ -110,10 +111,10 @@ type TarRes struct {
 	// how rsync chooses if it copies in the base directory or not.
 	Inputs []string `lang:"inputs" yaml:"inputs"`
 
-	// Format is the header format to use. If you change this, then the
-	// file will get rearchived. The strange thing is that it seems the
-	// header format is stored for each individual file. The available
-	// values are: const.res.tar.format.unknown, const.res.tar.format.ustar,
+	// Format is the header format to use. If you change this, then the file
+	// will get rearchived. The strange thing is that it seems the header
+	// format is stored for each individual file. The available values are:
+	// const.res.tar.format.unknown, const.res.tar.format.ustar,
 	// const.res.tar.format.pax, and const.res.tar.format.gnu which have
 	// values of 0, 2, 4, and 8 respectively.
 	Format int `lang:"format" yaml:"format"`
@@ -198,7 +199,7 @@ func (obj *TarRes) Watch(ctx context.Context) error {
 	}
 	defer recWatcher.Close()
 
-	chanList := []<-chan recwatch.Event{}
+	chanList := []<-chan *recwatch.Event{}
 	for _, x := range obj.Inputs {
 		fi, err := os.Stat(x)
 		if err != nil {
@@ -216,7 +217,9 @@ func (obj *TarRes) Watch(ctx context.Context) error {
 	}
 	events := recwatch.MergeChannels(chanList...)
 
-	obj.init.Running() // when started, notify engine that we're running
+	if err := obj.init.Event(ctx); err != nil {
+		return err
+	}
 
 	for {
 		select {
@@ -226,6 +229,10 @@ func (obj *TarRes) Watch(ctx context.Context) error {
 				// was a `return nil`, and i'm not sure why...
 				//return nil
 				return fmt.Errorf("unexpected close")
+			}
+			if event == nil {
+				// programming error
+				return fmt.Errorf("unexpected nil recwatch event")
 			}
 			if err := event.Error; err != nil {
 				return errwrap.Wrapf(err, "unknown %s watcher error", obj)
@@ -241,6 +248,10 @@ func (obj *TarRes) Watch(ctx context.Context) error {
 				//return nil
 				return fmt.Errorf("unexpected close")
 			}
+			if event == nil {
+				// programming error
+				return fmt.Errorf("unexpected nil recwatch event")
+			}
 			if err := event.Error; err != nil {
 				return errwrap.Wrapf(err, "unknown %s watcher error", obj)
 			}
@@ -249,10 +260,12 @@ func (obj *TarRes) Watch(ctx context.Context) error {
 			}
 
 		case <-ctx.Done(): // closed by the engine to signal shutdown
-			return nil
+			return ctx.Err()
 		}
 
-		obj.init.Event() // notify engine of an event (this can block)
+		if err := obj.init.Event(ctx); err != nil {
+			return err
+		}
 	}
 }
 
@@ -260,8 +273,11 @@ func (obj *TarRes) Watch(ctx context.Context) error {
 // input is true. It returns error info and if the state check passed or not.
 // This is where we actually do the archiving into a tar file work when needed.
 func (obj *TarRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 
-	h1, err := obj.hashFile(obj.getPath()) // output
+	h1, err := obj.hashFile(ctx, obj.getPath()) // output
 	if err != nil {
 		return false, err
 	}
@@ -276,6 +292,9 @@ func (obj *TarRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 	i1 := ""
 	i1 = obj.formatPrefix() + "\n" // add the prefix so it is considered
 	for _, x := range obj.Inputs {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
 		fi, err := os.Stat(x)
 		if err != nil {
 			return false, err
@@ -284,7 +303,7 @@ func (obj *TarRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 
 		//if !strings.HasSuffix(x, "/") // not dir
 		if !fi.IsDir() {
-			h, err := obj.hashFile(x)
+			h, err := obj.hashFile(ctx, x)
 			if err != nil {
 				return false, err
 			}
@@ -300,6 +319,9 @@ func (obj *TarRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 			if err != nil {
 				return err
 			}
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			if d.IsDir() {
 				if path == "." { // special case for root
 					i1 += x + "|" + "\n"
@@ -311,7 +333,7 @@ func (obj *TarRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 			}
 
 			// file
-			h, err := obj.hashFile(x + path)
+			h, err := obj.hashFile(ctx, x+path)
 			if err != nil {
 				return err
 			}
@@ -326,6 +348,9 @@ func (obj *TarRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 
 	i2, err := obj.readHashFile(obj.varDirPathInput, false)
 	if err != nil {
+		return false, err
+	}
+	if err := ctx.Err(); err != nil {
 		return false, err
 	}
 
@@ -379,6 +404,9 @@ func (obj *TarRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 	defer tarWriter.Close()                 // Might as well always close if we error early!
 
 	for _, x := range obj.Inputs {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
 		isDir, exists := isDirCache[x]
 		if !exists {
 			// programming error
@@ -395,7 +423,7 @@ func (obj *TarRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 			}
 			fsys := os.DirFS(x) // fs.FS
 			// TODO: formerly tarWriter.AddFS(fsys) // buggy!
-			if err := obj.addFS(tarWriter, fsys, prefix); err != nil {
+			if err := obj.addFS(ctx, tarWriter, fsys, prefix); err != nil {
 				return false, errwrap.Wrapf(err, "error writing: %s", x)
 			}
 			continue
@@ -436,7 +464,7 @@ func (obj *TarRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 		}
 
 		// Copy the input file into the writer, which archives it out.
-		count, err := io.Copy(tarWriter, f) // dst, src
+		count, err := util.CopyContext(ctx, tarWriter, f) // dst, src
 		if err != nil {
 			return false, err
 		}
@@ -451,6 +479,9 @@ func (obj *TarRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 
 	// NOTE: Must run this before hashing so that it includes the footer!
 	if err := tarWriter.Close(); err != nil {
+		return false, err
+	}
+	if err := ctx.Err(); err != nil {
 		return false, err
 	}
 	sha256sum := hex.EncodeToString(hash.Sum(nil))
@@ -484,9 +515,9 @@ func (obj *TarRes) formatPrefix() string {
 }
 
 // hashContent is a simple helper to run our hashing function.
-func (obj *TarRes) hashContent(handle io.Reader) (string, error) {
+func (obj *TarRes) hashContent(ctx context.Context, handle io.Reader) (string, error) {
 	hash := sha256.New()
-	if _, err := io.Copy(hash, handle); err != nil {
+	if _, err := util.CopyContext(ctx, hash, handle); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(hash.Sum(nil)), nil
@@ -494,7 +525,7 @@ func (obj *TarRes) hashContent(handle io.Reader) (string, error) {
 
 // hashFile is a helper that returns the hash of the specified file. If the file
 // doesn't exist, it returns the empty string. Otherwise it errors.
-func (obj *TarRes) hashFile(file string) (string, error) {
+func (obj *TarRes) hashFile(ctx context.Context, file string) (string, error) {
 	f, err := os.Open(file) // io.Reader
 	if err != nil && !os.IsNotExist(err) {
 		// This is likely a permissions error.
@@ -508,7 +539,7 @@ func (obj *TarRes) hashFile(file string) (string, error) {
 
 	// File exists, lets hash it!
 
-	return obj.hashContent(f)
+	return obj.hashContent(ctx, f)
 }
 
 // readHashFile reads the hashed value that we stored for the output file.
@@ -531,9 +562,12 @@ func (obj *TarRes) readHashFile(file string, trim bool) (string, error) {
 
 // addFS is an edited copy of archive/tar's *Writer.AddFs function. This version
 // correctly adds the directories too! https://github.com/golang/go/issues/69459
-func (obj *TarRes) addFS(tw *tar.Writer, fsys fs.FS, prefix string) error {
+func (obj *TarRes) addFS(ctx context.Context, tw *tar.Writer, fsys fs.FS, prefix string) error {
 	return fs.WalkDir(fsys, ".", func(name string, d fs.DirEntry, err error) error {
 		if err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
 			return err
 		}
 		if name == "." {
@@ -570,7 +604,7 @@ func (obj *TarRes) addFS(tw *tar.Writer, fsys fs.FS, prefix string) error {
 			return err
 		}
 		defer f.Close()
-		_, err = io.Copy(tw, f)
+		_, err = util.CopyContext(ctx, tw, f)
 		return err
 	})
 }

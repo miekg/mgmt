@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
 # check for any markdown files that aren't in an ideal format
 
+# XXX: mdl versions after 0.15.0 break the standard markdown parsing rules, see:
+# https://github.com/markdownlint/markdownlint/issues/576 and:
+# https://github.com/markdownlint/markdownlint/issues/573
+#
+# install with: `gem install mdl -v 0.15.0 --no-document`
+#
+# If it doesn't show the correct version when you do `mdl --version` try:
+# `gem uninstall mdl -v 0.17.0 || gem uninstall mdl -v 0.16.0` since gem may try
+# to always run the latest version that's installed.
+
 echo running "$0 $*"
 set -o errexit
 #set -o nounset
@@ -58,10 +68,10 @@ if [ "$1" = "--check-links" ]; then
 fi
 
 find_files() {
-	git ls-files | grep '\.md$'
+	repo_files | grep '\.md$'
 }
 
-F=${1:-}	# only check this file from $1 is specified
+F=${1:-}	# only check this file from $1 if specified
 
 bad_files=$(
 	for i in $(find_files); do
@@ -82,8 +92,7 @@ bad_files=$(
 
 		# check links in docs
 		if $CHECK_LINKS; then
-			# if file is from the directory docs/ then check links
-			if [[ "$i" == docs/* ]] && ! "$LYCHEE" -n "$i" 1>&2; then
+			if ! "$LYCHEE" --root-dir . --accept 200..300,302,429 --timeout 120 --max-retries 2 -n -v "$i" 1>&2; then
 				echo "$i"
 			fi
 		fi

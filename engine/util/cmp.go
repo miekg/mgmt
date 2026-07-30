@@ -33,6 +33,20 @@ import (
 	"fmt"
 )
 
+// BoolPtrCmp compares two pointers to booleans. If they aren't both nil or
+// aren't both of the same value, then this errors.
+func BoolPtrCmp(x, y *bool) error {
+	if (x == nil) != (y == nil) { // xor
+		return fmt.Errorf("the ptr differs")
+	}
+	if x != nil && y != nil {
+		if *x != *y { // compare the booleans
+			return fmt.Errorf("the contents of ptr differ")
+		}
+	}
+	return nil
+}
+
 // StrPtrCmp compares two pointers to strings. If they aren't both nil or aren't
 // both of the same value, then this errors.
 func StrPtrCmp(x, y *string) error {
@@ -59,5 +73,25 @@ func StrListCmp(x, y []string) error {
 		}
 	}
 
+	return nil
+}
+
+// StrSetCmp compares two lists of strings as multisets: order is ignored, but
+// duplicates count. It does not mutate either input. Errors if the contents
+// differ.
+func StrSetCmp(x, y []string) error {
+	if len(x) != len(y) {
+		return fmt.Errorf("the length differs")
+	}
+	count := make(map[string]int, len(x))
+	for _, s := range x {
+		count[s]++
+	}
+	for _, s := range y {
+		count[s]--
+		if count[s] < 0 {
+			return fmt.Errorf("element %q differs", s)
+		}
+	}
 	return nil
 }

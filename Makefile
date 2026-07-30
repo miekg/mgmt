@@ -28,18 +28,23 @@
 # additional permission.
 
 SHELL = bash
-.PHONY: all art cleanart version program lang path deps run race generate build build-debug crossbuild clean test gofmt yamlfmt format docs
+.PHONY: all art cleanart version program lang path deps run race generate build build-debug crossbuild clean test gofmt godocfmt yamlfmt format docs
 .PHONY: rpmbuild mkdirs rpm srpm spec tar upload upload-sources upload-srpms upload-rpms upload-releases copr tag
 .PHONY: mkosi mkosi_fedora-latest mkosi_fedora-older mkosi_stream-latest mkosi_debian-stable mkosi_ubuntu-latest mkosi_archlinux
 .PHONY: release release_test releases_path release_binary_amd64 release_binary_arm64 release_fedora-latest release_fedora-older release_stream-latest release_debian-stable release_ubuntu-latest release_archlinux
-.PHONY: funcgen
+.PHONY: funcgen FORCE
 .SILENT: clean
 
 # a large amount of output from this `find`, can cause `make` to be much slower!
-GO_FILES := $(shell find * -name '*.go' -not -path 'old/*' -not -path 'tmp/*')
-MCL_FILES := $(shell find lang/ -name '*.mcl' -not -path 'old/*' -not -path 'tmp/*')
-MISC_FILES := $(shell find engine/resources/http_server_ui/)
-PO_FILES := $(shell find * -name '*.po' -not -path 'old/*' -not -path 'tmp/*')
+GO_FILES_FIND = find * -name '*.go' -not -path 'old/*' -not -path 'tmp/*'
+MCL_FILES_FIND = find lang/ -name '*.mcl' -not -path 'old/*' -not -path 'tmp/*'
+MISC_FILES_FIND = find engine/resources/http_server_ui/
+PO_FILES_FIND = find * -name '*.po' -not -path 'old/*' -not -path 'tmp/*'
+GO_FILES := $(shell $(GO_FILES_FIND))
+MCL_FILES := $(shell $(MCL_FILES_FIND))
+MISC_FILES := $(shell $(MISC_FILES_FIND))
+PO_FILES := $(shell $(PO_FILES_FIND))
+FILES_STAMP = build/.stamp
 
 SVERSION := $(or $(SVERSION),$(shell git describe --match '[0-9]*\.[0-9]*\.[0-9]*' --tags --dirty --always))
 VERSION := $(or $(VERSION),$(shell git describe --match '[0-9]*\.[0-9]*\.[0-9]*' --tags --abbrev=0))
@@ -60,7 +65,17 @@ endif
 ifeq ($(MGMT_NOGOLANGRACE),true)
 	GOLANGRACE =
 else
-	GOLANGRACE = -race
+	# can't use -race with CGO_ENABLED=0
+	ifeq ($(MGMT_NOCGO),true)
+		GOLANGRACE =
+	else
+		GOLANGRACE = -race
+	endif
+endif
+ifeq ($(MGMT_NOCGO),true)
+	GOLANGCGO = CGO_ENABLED=0
+else
+	GOLANGCGO =
 endif
 ARCH = $(uname -m)
 SPEC = rpmbuild/SPECS/$(PROGRAM).spec
@@ -222,40 +237,57 @@ resources: ## builds the resources dependencies required for the engine backend
 $(PROGRAM): build/mgmt-${GOHOSTOS}-${GOHOSTARCH} ## build an mgmt binary for current host os/arch
 	cp -a $< $@
 
-$(PROGRAM).static: $(GO_FILES) $(MCL_FILES) $(MISC_FILES) $(PO_FILES) go.mod go.sum
+$(PROGRAM).static: $(FILES_STAMP) $(GO_FILES) $(MCL_FILES) $(MISC_FILES) $(PO_FILES) go.mod go.sum
 	@echo "Building: $(PROGRAM).static, version: $(SVERSION)..."
 	go generate
 	go build $(TRIMPATH) -a -installsuffix cgo -tags netgo -ldflags '-extldflags "-static" -X main.program=$(PROGRAM) -X main.version=$(SVERSION) -s -w' -o $(PROGRAM).static $(BUILD_FLAGS);
 
+# Export these target-specific variables to the recursive make below.
+export LDFLAGS BUILD_FLAGS
+
 build: LDFLAGS=-s -w ## build a fresh mgmt binary
-build: $(PROGRAM)
+build: lang resources funcgen
+	@$(MAKE) --no-print-directory $(PROGRAM)
 
 build-debug: LDFLAGS=
-build-debug: $(PROGRAM)
+build-debug: lang resources funcgen
+	@$(MAKE) --no-print-directory $(PROGRAM)
 
 # if you're using the bad/dev branch, you might want this too!
 baddev: BUILD_FLAGS = -tags 'noaugeas novirt'
-baddev: $(PROGRAM)
+baddev: lang resources funcgen
+	@$(MAKE) --no-print-directory $(PROGRAM)
 
 # pattern rule target for (cross)building, mgmt-OS-ARCH will be expanded to the correct build
 # extract os and arch from target pattern
 GOOS=$(firstword $(subst -, ,$*))
 GOARCH=$(lastword $(subst -, ,$*))
-build/mgmt-%: $(GO_FILES) $(MCL_FILES) $(MISC_FILES) $(PO_FILES) go.mod go.sum | lang resources funcgen
+build/mgmt-%: $(FILES_STAMP) $(GO_FILES) $(MCL_FILES) $(MISC_FILES) $(PO_FILES) go.mod go.sum | lang resources funcgen
 	@# If you need to run `go mod tidy` then this can trigger.
 	@if [ "$(PKGNAME)" = "" ]; then echo "\$$(PKGNAME) is empty, test with: go list ."; exit 42; fi
 	@echo "Building: $(PROGRAM), os/arch: $*, version: $(SVERSION)..."
 	@# XXX: leave race detector on by default for now. For production
 	@# builds, we can consider turning it off for performance improvements.
 	@# XXX: ./mgmt run --tmp-prefix lang something_fast.mcl > /tmp/race 2>&1 # search for "WARNING: DATA RACE"
-	time env GOOS=${GOOS} GOARCH=${GOARCH} go build $(TRIMPATH) $(GOLANGRACE) -ldflags=$(PKGNAME)="-X main.program=$(PROGRAM) -X main.version=$(SVERSION) ${LDFLAGS}" -o $@ $(BUILD_FLAGS)
+	time env $(GOLANGCGO) GOOS=${GOOS} GOARCH=${GOARCH} go build $(TRIMPATH) $(GOLANGRACE) -ldflags=$(PKGNAME)="-X main.program=$(PROGRAM) -X main.version=$(SVERSION) ${LDFLAGS}" -o $@ $(BUILD_FLAGS)
+
+# The file lists above are expanded before make considers targets. If a source
+# file is deleted, it disappears from the prerequisites, so this stamp tracks
+# list membership and changes only when files are added or removed.
+$(FILES_STAMP): FORCE
+	@mkdir -p $(@D)
+	@{ $(GO_FILES_FIND); $(MCL_FILES_FIND); $(MISC_FILES_FIND); $(PO_FILES_FIND); } | sort > $@.tmp
+	@if ! test -f $@ || ! cmp -s $@.tmp $@; then mv $@.tmp $@; else rm $@.tmp; fi
+
+FORCE:
 
 # create a list of binary file names to use as make targets
 # to use this you might want to run something like:
 # GOOSARCHES='linux/arm64' GOTAGS='noaugeas novirt' make crossbuild
 # and the output will end up in build/
 crossbuild_targets = $(addprefix build/mgmt-,$(subst /,-,${GOOSARCHES}))
-crossbuild: ${crossbuild_targets}
+crossbuild: lang resources funcgen
+	@$(MAKE) --no-print-directory ${crossbuild_targets}
 
 clean: ## clean things up
 	$(MAKE) --quiet -C test clean
@@ -288,11 +320,14 @@ $(addprefix test-shell-,${test_shell}): test-shell-%: build
 
 gofmt:
 	# TODO: remove gofmt once goimports has a -s option
-	find . -maxdepth 9 -type f -name '*.go' -not -path './old/*' -not -path './tmp/*' -not -path './vendor/*' -exec gofmt -s -w {} \;
-	find . -maxdepth 9 -type f -name '*.go' -not -path './old/*' -not -path './tmp/*' -not -path './vendor/*' -exec goimports -w {} \;
+	find . -maxdepth 9 \( -type f -o -type l \) -name '*.go' -not -path './old/*' -not -path './tmp/*' -not -path './vendor/*' -exec gofmt -s -w {} +
+	find . -maxdepth 9 \( -type f -o -type l \) -name '*.go' -not -path './old/*' -not -path './tmp/*' -not -path './vendor/*' -exec goimports -w {} +
+
+godocfmt: ## reflow golang doc comments
+	find . -maxdepth 9 \( -type f -o -type l \) -name '*.go' -not -path './old/*' -not -path './tmp/*' -not -path './vendor/*' \( -type l -o -not -exec git check-ignore --no-index -q -- {} \; \) -exec go run ./test/tools/reflowed-comments/ -w {} +
 
 yamlfmt:
-	find . -maxdepth 3 -type f -name '*.yaml' -not -path './old/*' -not -path './tmp/*' -not -path './omv.yaml' -exec ruby -e "require 'yaml'; x=YAML.load_file('{}').to_yaml.each_line.map(&:rstrip).join(10.chr)+10.chr; File.open('{}', 'w').write x" \;
+	find . -maxdepth 3 \( -type f -o -type l \) -name '*.yaml' -not -path './old/*' -not -path './tmp/*' -not -path './omv.yaml' -exec ruby -e "require 'yaml'; x=YAML.load_file('{}').to_yaml.each_line.map(&:rstrip).join(10.chr)+10.chr; File.open('{}', 'w').write x" \;
 
 format: gofmt yamlfmt ## format yaml and golang code
 
@@ -518,16 +553,16 @@ releases_path:
 	@echo "releases/$(VERSION)/"
 
 release_test: $(DEP_BINARY_AMD64) $(DEP_BINARY_ARM64) $(DEP_FEDORA-LATEST) $(DEP_FEDORA-OLDER) $(DEP_STREAM-LATEST) $(DEP_DEBIAN-STABLE) $(DEP_UBUNTU-LATEST) $(DEP_ARCHLINUX) $(SHA256SUMS_ASC)
-	@echo '$$< denotes ‘the first dependency of the current rule’.'
+	@echo '$$< denotes "the first dependency of the current rule".'
 	@echo '> '"$<"
 	@echo
-	@echo '$$@ denotes ‘the target of the current rule’.'
+	@echo '$$@ denotes "the target of the current rule".'
 	@echo '> '"$@"
 	@echo
-	@echo '$$^ denotes ‘the dependencies of the current rule’.'
+	@echo '$$^ denotes "the dependencies of the current rule".'
 	@echo '> '"$^"
 	@echo
-	@echo '$$* denotes ‘the stem with which the pattern of the current rule matched’.'
+	@echo '$$* denotes "the stem with which the pattern of the current rule matched".'
 	@echo '> '"$*"
 	@echo
 	@echo "TOKEN_BINARY_AMD64: $(TOKEN_BINARY_AMD64)"

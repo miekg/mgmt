@@ -39,10 +39,9 @@ import (
 	"github.com/purpleidea/mgmt/cli"
 	cliUtil "github.com/purpleidea/mgmt/cli/util"
 	"github.com/purpleidea/mgmt/entry"
-	_ "github.com/purpleidea/mgmt/gapi/empty"        // import so the gapi registers
-	_ "github.com/purpleidea/mgmt/lang/gapi"         // import so the gapi registers
-	_ "github.com/purpleidea/mgmt/puppet"            // import so the gapi registers
-	_ "github.com/purpleidea/mgmt/puppet/langpuppet" // import so the gapi registers
+	_ "github.com/purpleidea/mgmt/gapi/empty" // import so the gapi registers
+	_ "github.com/purpleidea/mgmt/lang/gapi"  // import so the gapi registers
+	"github.com/purpleidea/mgmt/util"
 	"github.com/purpleidea/mgmt/util/pprof"
 	_ "github.com/purpleidea/mgmt/yamlgraph" // import so the gapi registers
 	"go.etcd.io/etcd/server/v3/etcdmain"
@@ -96,8 +95,8 @@ func main() {
 	// TODO: Should we pass a logger into this?
 	ctx, cancel := context.WithCancel(context.Background())
 	if err := pprof.Run(ctx); err != nil {
-		fmt.Println(err)
-		os.Exit(1)
+		fmt.Println(err) // TODO: let pprof log errors
+		os.Exit(util.ExitCode(err))
 		//return // redundant
 	}
 	defer cancel()
@@ -110,16 +109,16 @@ func main() {
 	if cli, err := entry.Lookup(name); err == nil && cli.Name() == name {
 		data.Args = data.Args[1:] // pop off "argv[0]"
 		if err := cli.CLI(context.Background(), data); err != nil {
-			fmt.Println(err)
-			os.Exit(1)
+			//fmt.Println(err)
+			os.Exit(util.ExitCode(err))
 			//return // redundant
 		}
 		return
 	}
 
 	if err := cli.CLI(context.Background(), data); err != nil {
-		fmt.Println(err)
-		os.Exit(1)
-		return
+		//fmt.Println(err)
+		os.Exit(util.ExitCode(err))
+		//return // redundant
 	}
 }

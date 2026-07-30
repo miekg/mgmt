@@ -216,7 +216,9 @@ func TestValueOfJSON1(t *testing.T) {
 	}
 
 	d1 := types.NewMap(types.NewType("map{str: int}"))
-	d1.Set(&types.StrValue{V: "answer"}, &types.IntValue{V: 42})
+	if err := d1.Set(&types.StrValue{V: "answer"}, &types.IntValue{V: 42}); err != nil {
+		t.Fatalf("func Set: %v", err)
+	}
 	test(`{"answer": 42}`, nil, d1)
 
 	// json doesn't support non-string keys for maps
@@ -250,7 +252,6 @@ func TestValueOfJSON1(t *testing.T) {
 	for index, tc := range testCases {
 		name := fmt.Sprintf("test ValueOfJSON1 #%d_", index)
 
-		tc := tc
 		t.Run(name, func(t *testing.T) {
 			t.Logf("json: %s", tc.str)
 			typ := tc.typ

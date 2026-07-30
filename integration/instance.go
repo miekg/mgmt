@@ -52,9 +52,9 @@ const (
 	// directory which is used for the mgmt prefix.
 	PrefixDirectory = "prefix"
 
-	// ConvergedStatusFile is the name of the file which is used for the
-	// converged status tracking.
-	ConvergedStatusFile = "csf.txt"
+	// ConvergerStatusFile is the name of the file which is used for the
+	// converger status tracking.
+	ConvergerStatusFile = "csf.txt"
 
 	// StdoutStderrFile is the name of the file which is used for the
 	// command output.
@@ -64,9 +64,9 @@ const (
 	// If we exceed this timeout, then it's likely we are blocked somewhere.
 	longTimeout = 60 // seconds
 
-	// convergedTimeout is the number of seconds we wait for our instance to
+	// convergerTimeout is the number of seconds we wait for our instance to
 	// remain unchanged to be considered as converged.
-	convergedTimeout = 15 // seconds
+	convergerTimeout = 15 // seconds
 
 	// dirMode is the the mode used when making directories.
 	dirMode = 0755
@@ -105,8 +105,8 @@ type Instance struct {
 
 	tmpPrefixDirectory   string
 	testRootDirectory    string
-	convergedStatusFile  string
-	convergedStatusIndex int
+	convergerStatusFile  string
+	convergerStatusIndex int
 
 	cmd *exec.Cmd
 
@@ -146,7 +146,7 @@ func (obj *Instance) Init() error {
 	}
 	obj.testRootDirectory = testRootDirectory
 
-	obj.convergedStatusFile = path.Join(obj.dir, ConvergedStatusFile)
+	obj.convergerStatusFile = path.Join(obj.dir, ConvergerStatusFile)
 
 	return nil
 }
@@ -161,7 +161,7 @@ func (obj *Instance) Close() error {
 			return errwrap.Wrapf(err, "can't remove instance dir")
 		}
 	}
-	obj.Kill() // safety
+	_ = obj.Kill() // safety
 	return nil
 }
 
@@ -250,9 +250,8 @@ func (obj *Instance) Run(seeds []*Instance) error {
 		fmt.Sprintf("--client-urls=%s", obj.clientURL),
 		fmt.Sprintf("--server-urls=%s", obj.serverURL),
 		fmt.Sprintf("--prefix=%s", obj.tmpPrefixDirectory),
-		fmt.Sprintf("--converged-timeout=%d", convergedTimeout),
-		"--converged-timeout-no-exit",
-		fmt.Sprintf("--converged-status-file=%s", obj.convergedStatusFile),
+		fmt.Sprintf("--converger-timeout=%d", convergerTimeout), // no exit!
+		fmt.Sprintf("--converger-status-file=%s", obj.convergerStatusFile),
 	}
 	if len(seeds) > 0 {
 		urls := []string{}
@@ -331,7 +330,7 @@ func (obj *Instance) Quit(ctx context.Context) error {
 		select {
 		case err = <-done:
 		case <-ctx.Done():
-			obj.Kill() // should cause the Wait() to exit
+			_ = obj.Kill() // should cause the Wait() to exit
 			err = ctx.Err()
 		}
 	}()
@@ -341,11 +340,22 @@ func (obj *Instance) Quit(ctx context.Context) error {
 	return err
 }
 
-// Wait until the first converged state we hit. It is not necessary to use the
-// `--converged-timeout` option with mgmt for this to work. It tracks this via
-// the `--converged-status-file` option which can be used to track the varying
+// Wait until the first converger state we hit. It is not necessary to use the
+// `--converger-timeout` option with mgmt for this to work. It tracks this via
+// the `--converger-status-file` option which can be used to track the varying
 // convergence status.
 func (obj *Instance) Wait(ctx context.Context) error {
+	return obj.wait(ctx, false)
+}
+
+// WaitForConvergedAfterActivity waits until the first converged state we hit
+// after seeing activity. This is useful after deploys where an older true line
+// from the startup graph must not satisfy the wait.
+func (obj *Instance) WaitForConvergedAfterActivity(ctx context.Context) error {
+	return obj.wait(ctx, true)
+}
+
+func (obj *Instance) wait(ctx context.Context, requireActivity bool) error {
 	//if obj.cmd == nil { // TODO: should we include this?
 	//	return fmt.Errorf("no process is running")
 	//}
@@ -355,13 +365,14 @@ func (obj *Instance) Wait(ctx context.Context) error {
 	}
 
 	recurse := false
-	recWatcher, err := recwatch.NewRecWatcher(obj.convergedStatusFile, recurse)
+	recWatcher, err := recwatch.NewRecWatcher(obj.convergerStatusFile, recurse)
 	if err != nil {
 		return errwrap.Wrapf(err, "could not watch file")
 	}
 	defer recWatcher.Close()
 	startup := make(chan struct{})
 	close(startup)
+	activity := !requireActivity
 	for {
 		select {
 		// FIXME: instead of sending one event here, the recwatch
@@ -374,6 +385,10 @@ func (obj *Instance) Wait(ctx context.Context) error {
 			if !ok {
 				return fmt.Errorf("file watcher shut down")
 			}
+			if event == nil {
+				// programming error
+				return fmt.Errorf("unexpected nil recwatch event")
+			}
 			if err := event.Error; err != nil {
 				return errwrap.Wrapf(err, "error event received")
 			}
@@ -385,7 +400,7 @@ func (obj *Instance) Wait(ctx context.Context) error {
 			return ctx.Err()
 		}
 
-		contents, err := os.ReadFile(obj.convergedStatusFile)
+		contents, err := os.ReadFile(obj.convergerStatusFile)
 		if err != nil {
 			continue // file might not exist yet, wait for an event
 		}
@@ -398,17 +413,24 @@ func (obj *Instance) Wait(ctx context.Context) error {
 			lines = append(lines, x)
 		}
 
-		if c := len(lines); c < obj.convergedStatusIndex {
+		if c := len(lines); c < obj.convergerStatusIndex {
 			return fmt.Errorf("file is missing lines or was truncated, got: %d", c)
 		}
 
 		var converged bool
-		for i := obj.convergedStatusIndex; i < len(lines); i++ {
-			obj.convergedStatusIndex = i + 1 // new max
+		for i := obj.convergerStatusIndex; i < len(lines); i++ {
 			line := lines[i]
-			if line == "true" { // converged!
-				converged = true
+			if line == "false" { // activity!
+				obj.convergerStatusIndex = i + 1 // new max
+				activity = true
+				continue
 			}
+			if line == "true" { // converged!
+				obj.convergerStatusIndex = i + 1 // new max
+				converged = activity
+				continue
+			}
+			break // possibly a partial write; do not consume it yet
 		}
 		if converged {
 			return nil

@@ -119,11 +119,13 @@ func (obj *MsgRes) Cleanup() error {
 
 // Watch is the primary listener for this resource and it outputs events.
 func (obj *MsgRes) Watch(ctx context.Context) error {
-	obj.init.Running() // when started, notify engine that we're running
+	if err := obj.init.Event(ctx); err != nil {
+		return err
+	}
 
 	select {
 	case <-ctx.Done(): // closed by the engine to signal shutdown
-		return nil
+		return ctx.Err()
 	}
 }
 

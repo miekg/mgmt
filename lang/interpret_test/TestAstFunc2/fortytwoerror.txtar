@@ -10,9 +10,13 @@ $myfortytwo = func() {
 $a = $myfortytwo() + 4
 $b = $myfortytwo() + 3.0
 
-test ["x",] {
+test ["x"] {
 	int8 => $a,
 	float32 => $b,
 }
 -- OUTPUT --
 # err: errUnify: type error: int != float: /main.mcl @ 10:6-10:25
+type error: int != float: /main.mcl @ 10:6-10:25
+
+$b = $myfortytwo() + 3.0
+     ^^^^^^^^^^^^^^^^^^^

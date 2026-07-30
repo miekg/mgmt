@@ -79,6 +79,13 @@ type State struct {
 
 	mutex *sync.RWMutex // used for editing state properties
 
+	// pMutex guards pCancel below.
+	pMutex *sync.Mutex
+
+	// pCancel cancels the context of the currently running Process so that
+	// Watch can interrupt it. It is nil when no Process runs.
+	pCancel context.CancelFunc
+
 	// doneCtx is cancelled when Watch should shut down. When any of the
 	// following channels close, it causes this to close.
 	doneCtx context.Context
@@ -112,7 +119,7 @@ type State struct {
 	// eventsChan is the channel that the engine listens on for events from
 	// the Watch loop for that resource. The event is nil normally, except
 	// when events are sent on this channel from the engine. This only
-	// happens as a signaling mechanism when Watch has shutdown and we want
+	// happens as a signalling mechanism when Watch has shutdown and we want
 	// to notify the Process loop which reads from this.
 	eventsChan chan error // outgoing from resource
 
@@ -161,6 +168,7 @@ func (obj *State) Init() error {
 	obj.isStateOK = &atomic.Bool{}
 
 	obj.mutex = &sync.RWMutex{}
+	obj.pMutex = &sync.Mutex{}
 	obj.doneCtx, obj.doneCtxCancel = context.WithCancel(context.Background())
 
 	obj.processDone = make(chan struct{})
@@ -174,7 +182,7 @@ func (obj *State) Init() error {
 
 	obj.pokeChan = make(chan struct{}, 1) // must be buffered
 
-	//obj.paused = false // starts off as started
+	obj.paused = true // starts off as paused
 	obj.pauseSignal = make(chan struct{})
 	obj.resumeSignal = make(chan struct{})
 
@@ -189,8 +197,7 @@ func (obj *State) Init() error {
 		Hostname: obj.Hostname,
 
 		// Watch:
-		Running: obj.event,
-		Event:   obj.event,
+		Event: obj.event,
 
 		// CheckApply:
 		Refresh: func() bool {
@@ -298,6 +305,8 @@ func (obj *State) Cleanup() error {
 		return fmt.Errorf("vertex is not a Res")
 	}
 
+	obj.doneCtxCancel() // probably not required, but add as an extra safety
+
 	//if obj.cuid != nil {
 	//	obj.cuid.Unregister() // gets unregistered in Worker()
 	//}
@@ -344,15 +353,30 @@ func (obj *State) Poke() {
 	}
 }
 
-// Pause pauses this resource. It must not be called on any already paused
+// Pause pauses this resource. It must not be called on any already paused live
 // resource. It will block until the resource pauses with an acknowledgment, or
-// until an exit for that resource is seen. If the latter happens it will error.
-// It must not be called concurrently with either the Resume() method or itself,
-// so only call these one at a time and alternate between the two.
+// until an exit for that resource is seen. If the latter happens it will error,
+// regardless of the last pause state. It must not be called concurrently with
+// either the Resume() method or itself, so only call these one at a time and
+// alternate between the two.
 func (obj *State) Pause() error {
 	if obj.paused {
-		panic("already paused")
+		select {
+		case <-obj.doneCtx.Done():
+			return engine.ErrClosed
+		default:
+			// programming error
+			panic("already paused")
+		}
 	}
+
+	// Pause runs here, but if this resource has already errored (eg:
+	// CheckApply errored for some reason) then that resource will exit and
+	// instead of sending the `obj.pauseSignal`, we'll hit the
+	// `obj.doneCtx.Done()` case and return without setting `obj.paused`.
+	//
+	// As a result, during the Resume call, it would normally error because
+	// it is only expecting resources with `obj.paused = true`.
 
 	// wait for ack (or exit signal)
 	select {
@@ -367,22 +391,36 @@ func (obj *State) Pause() error {
 	return nil
 }
 
-// Resume unpauses this resource. It can be safely called once on a brand-new
-// resource that has just started running, without incident. It must not be
+// Resume unpauses this resource. It can and must be called once on a brand-new
+// resource that has just started running as they start paused. It must not be
 // called concurrently with either the Pause() method or itself, so only call
 // these one at a time and alternate between the two.
-func (obj *State) Resume() {
-	// This paused check prevents unnecessary "resume" calls to the resource
-	// on its first run, since resources start in the running state!
-	if !obj.paused { // no need to unpause brand-new resources
-		return
+func (obj *State) Resume() error {
+	if !obj.paused { // for debug
+		select {
+		case <-obj.doneCtx.Done():
+			//return engine.ErrClosed // happens below the same way
+		default:
+			// programming error
+			panic("not paused or exited")
+		}
 	}
+
+	// If the resource already errored/exited, then we'll skip the
+	// `obj.resumeSignal` case here and not touch the `obj.paused` flag.
+	// Please read the comments in the corresponding Pause() function too.
 
 	select {
 	case obj.resumeSignal <- struct{}{}:
+		// we're resumed
+
+	case <-obj.doneCtx.Done():
+		return engine.ErrClosed
 	}
 
 	obj.paused = false
+
+	return nil
 }
 
 // event is a helper function to send an event to the CheckApply process loop.
@@ -390,15 +428,18 @@ func (obj *State) Resume() {
 // should instead use Poke() to "schedule" a new Process/CheckApply loop when
 // one might be needed. This method will block until we're unpaused and ready to
 // receive on the events channel.
-func (obj *State) event() {
-	obj.setDirty() // assume we're initially dirty
-
+func (obj *State) event(ctx context.Context) error {
+	// NOTE: The receiver runs setDirty for us. If we ran it here, and a
+	// Process was running while we blocked on this send, then that Process
+	// could complete afterwards and mark the state clean again, and this
+	// event would then wrongly skip its CheckApply, swallowing our change.
 	select {
 	case obj.eventsChan <- nil: // blocks! (this is unbuffered)
-		// send!
-	}
+		return nil
 
-	//return // implied
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // setDirty marks the resource state as dirty. This signals to the engine that
@@ -411,12 +452,14 @@ func (obj *State) setDirty() {
 }
 
 // poll is a replacement for Watch when the Poll metaparameter is used.
-func (obj *State) poll(ctx context.Context, interval uint32) error {
+func (obj *State) poll(ctx context.Context, interval int32) error {
 	// create a time.Ticker for the given interval
 	ticker := time.NewTicker(time.Duration(interval) * time.Second)
 	defer ticker.Stop()
 
-	obj.init.Running() // when started, notify engine that we're running
+	if err := obj.init.Event(ctx); err != nil {
+		return err
+	}
 
 	for {
 		select {
@@ -427,16 +470,52 @@ func (obj *State) poll(ctx context.Context, interval uint32) error {
 			return nil
 		}
 
-		obj.init.Event() // notify engine of an event (this can block)
+		if err := obj.init.Event(ctx); err != nil {
+			return err
+		}
+	}
+}
+
+// once is a replacement for Watch when the Poll metaparameter is negative.
+func (obj *State) once(ctx context.Context) error {
+	if err := obj.init.Event(ctx); err != nil {
+		return err
+	}
+
+	select {
+	case <-ctx.Done(): // signal for shutdown request
+		return nil
 	}
 }
 
 // hidden is a replacement for Watch when the Hidden metaparameter is used.
 func (obj *State) hidden(ctx context.Context) error {
-	obj.init.Running() // when started, notify engine that we're running
+	if err := obj.init.Event(ctx); err != nil {
+		return err
+	}
 
 	select {
 	case <-ctx.Done(): // signal for shutdown request
 		return nil
+	}
+}
+
+// registerProcessCancel saves the cancel function which can interrupt the
+// currently running Process. Pass nil to clear it. This is called by the
+// process loop around each Process invocation.
+func (obj *State) registerProcessCancel(cancel context.CancelFunc) {
+	obj.pMutex.Lock()
+	defer obj.pMutex.Unlock()
+	obj.pCancel = cancel
+}
+
+// interruptProcess cancels the currently running Process if there is one. It is
+// used when Watch fails, because a restarting Watch must never overlap with a
+// running Process.
+func (obj *State) interruptProcess() {
+	obj.pMutex.Lock()
+	defer obj.pMutex.Unlock()
+	if obj.pCancel != nil {
+		obj.pCancel()
 	}
 }

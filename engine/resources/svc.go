@@ -53,6 +53,8 @@ func init() {
 	engine.RegisterResource("svc", func() engine.Res { return &SvcRes{} })
 }
 
+var _ engine.EdgeableRes = &SvcRes{} // compile time check
+
 // The SystemdUnitMode* constants do the following from the docs:
 //
 // The mode needs to be one of replace, fail, isolate, ignore-dependencies,
@@ -212,24 +214,43 @@ func (obj *SvcRes) Watch(ctx context.Context) error {
 		}
 	}()
 
-	obj.init.Running() // when started, notify engine that we're running
+	if err := obj.init.Event(ctx); err != nil {
+		return err
+	}
 
 	svc := obj.svc() // systemd name
 
 	set := conn.NewSubscriptionSet() // no error should be returned
 	// XXX: dynamic bugs: https://github.com/coreos/go-systemd/issues/474
 	set.Add(svc) // it's okay if the svc doesn't exist yet
-	chSub, chSubErr := set.Subscribe()
+	chSub, chSubErr := set.SubscribeContext(ctx)
 	//defer close(chSub) // cannot close receive-only channel
 	//defer close(chSubErr) // cannot close receive-only channel
+	defer func() { // drain to avoid deadlock with this crappy function
+		// XXX: https://github.com/coreos/go-systemd/pull/514 or similar
+		chSubClosed := false
+		chSubErrClosed := false
+		for {
+			if chSubClosed && chSubErrClosed {
+				return
+			}
 
-	//chSubClosed := false
-	//chSubErrClosed := false
+			select {
+			case _, ok := <-chSub:
+				if !ok {
+					chSubClosed = true
+					chSub = nil
+				}
+			case _, ok := <-chSubErr:
+				if !ok {
+					chSubErrClosed = true
+					chSubErr = nil
+				}
+			}
+		}
+	}()
+
 	for {
-		//if chSubClosed && chSubErrClosed {
-		//
-		//}
-
 		if obj.init.Debug {
 			obj.init.Logf("watching...")
 		}
@@ -292,7 +313,6 @@ func (obj *SvcRes) Watch(ctx context.Context) error {
 		case event, ok := <-chSub:
 			if !ok {
 				chSub = nil
-				//chSubClosed = true
 				continue
 			}
 			if obj.init.Debug {
@@ -336,11 +356,23 @@ func (obj *SvcRes) Watch(ctx context.Context) error {
 		case err, ok := <-chSubErr:
 			if !ok {
 				chSubErr = nil
-				//chSubErrClosed = true
 				continue
 			}
 			if err == nil {
 				obj.init.Logf("unexpected nil error")
+				continue
+			}
+			// I think this happens if systemd package is updating.
+			// XXX: if chSubErr returns an err does it keep working?
+			// XXX: Do we have to restart the set.Subscribe ?
+			if err.Error() == "Remote peer disconnected" {
+				obj.init.Logf("remote peer disconnected")
+				select {
+				case <-time.After(1 * time.Second):
+					obj.init.Logf("remote peer retrying")
+				case <-ctx.Done():
+					return ctx.Err()
+				}
 				continue
 			}
 			return errwrap.Wrapf(err, "unknown error")
@@ -349,7 +381,9 @@ func (obj *SvcRes) Watch(ctx context.Context) error {
 			return ctx.Err()
 		}
 
-		obj.init.Event() // notify engine of an event (this can block)
+		if err := obj.init.Event(ctx); err != nil {
+			return err
+		}
 	}
 }
 
@@ -483,7 +517,7 @@ func (obj *SvcRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 		}
 		refresh = false // We did a start or stop, so a reload is not needed.
 
-		// TODO: Should we permanenty error after a long timeout here?
+		// TODO: Should we permanently error after a long timeout here?
 		for {
 			warn := true // warn once
 			select {
@@ -542,14 +576,14 @@ func (obj *SvcRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 
 	// From: https://www.freedesktop.org/software/systemd/man/latest/org.freedesktop.systemd1.html
 	// If a service is restarted that isn't running, it will be started
-	// unless the "Try" flavor is used in which case a service that isn't
-	// running is not affected by the restart. The "ReloadOrRestart" flavors
+	// unless the "Try" flavour is used in which case a service that isn't
+	// running is not affected by the restart. The ReloadOrRestart flavours
 	// attempt a reload if the unit supports it and use a restart otherwise.
 	if _, err := conn.ReloadOrTryRestartUnitContext(ctx, svc, SystemdUnitModeFail, result); err != nil {
 		return false, errwrap.Wrapf(err, "failed to reload unit")
 	}
 
-	// TODO: Should we permanenty error after a long timeout here?
+	// TODO: Should we permanently error after a long timeout here?
 	for {
 		warn := true // warn once
 		select {
@@ -615,6 +649,100 @@ func (obj *SvcRes) Cmp(r engine.Res) error {
 	}
 
 	return nil
+}
+
+// GroupCmp returns whether two resources can be grouped together or not.
+//func (obj *SvcRes) GroupCmp(r engine.GroupableRes) error {
+//	_, ok := r.(*SvcRes)
+//	if !ok {
+//		return fmt.Errorf("resource is not the same kind")
+//	}
+//	// TODO: depending on if the systemd service api allows batching, we
+//	// might be able to build this, although not sure how useful it is...
+//	// it might just eliminate parallelism by bunching up the graph
+//	return fmt.Errorf("not possible at the moment")
+//}
+
+// UnmarshalYAML is the custom unmarshal handler for this struct. It is
+// primarily useful for setting the defaults.
+func (obj *SvcRes) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	type rawRes SvcRes // indirection to avoid infinite recursion
+
+	def := obj.Default()     // get the default
+	res, ok := def.(*SvcRes) // put in the right format
+	if !ok {
+		return fmt.Errorf("could not convert to SvcRes")
+	}
+	raw := rawRes(*res) // convert; the defaults go here
+
+	if err := unmarshal(&raw); err != nil {
+		return err
+	}
+
+	*obj = SvcRes(raw) // restore from indirection with type conversion!
+	return nil
+}
+
+// AutoEdges returns the AutoEdge interface. In this case, systemd unit file
+// resources and cron (systemd-timer) resources.
+func (obj *SvcRes) AutoEdges(ctx context.Context) (engine.AutoEdge, error) {
+	var data []engine.ResUID
+	var svcFiles []string
+
+	svc := obj.svc() // systemd name
+
+	svcFiles = []string{
+		// root svc
+		fmt.Sprintf("/etc/systemd/system/%s", svc),     // takes precedence
+		fmt.Sprintf("/usr/lib/systemd/system/%s", svc), // pkg default
+	}
+	if obj.Session {
+		// user svc
+		u, err := user.Current()
+		if err != nil {
+			return nil, errwrap.Wrapf(err, "error getting current user")
+		}
+		if u.HomeDir == "" {
+			return nil, fmt.Errorf("user has no home directory")
+		}
+		svcFiles = []string{
+			path.Join(u.HomeDir, "/.config/systemd/user/", svc),
+		}
+	}
+	for _, x := range svcFiles {
+		var reversed = true
+		data = append(data, &FileUID{
+			BaseUID: engine.BaseUID{
+				Name:     obj.Name(),
+				Kind:     obj.Kind(),
+				Reversed: &reversed,
+			},
+			path: x, // what matters
+		})
+	}
+
+	fileEdge := &FileResAutoEdges{
+		data:    data,
+		pointer: 0,
+		found:   false,
+	}
+	cronEdge := &SvcResAutoEdgesCron{
+		session: obj.Session,
+		unit:    svc,
+	}
+
+	return engineUtil.AutoEdgeCombiner(fileEdge, cronEdge)
+}
+
+// UIDs includes all params to make a unique identification of this object. Most
+// resources only return one, although some resources can return multiple.
+func (obj *SvcRes) UIDs() []engine.ResUID {
+	x := &SvcUID{
+		BaseUID: engine.BaseUID{Name: obj.Name(), Kind: obj.Kind()},
+		name:    obj.Name(),  // svc name
+		session: obj.Session, // user session
+	}
+	return []engine.ResUID{x}
 }
 
 // SvcUID is the UID struct for SvcRes.
@@ -708,98 +836,4 @@ func (obj *SvcResAutoEdgesCron) Next() []engine.ResUID {
 // should continue.
 func (obj *SvcResAutoEdgesCron) Test([]bool) bool {
 	return false // only get one svc -> cron edge
-}
-
-// AutoEdges returns the AutoEdge interface. In this case, systemd unit file
-// resources and cron (systemd-timer) resources.
-func (obj *SvcRes) AutoEdges() (engine.AutoEdge, error) {
-	var data []engine.ResUID
-	var svcFiles []string
-
-	svc := obj.svc() // systemd name
-
-	svcFiles = []string{
-		// root svc
-		fmt.Sprintf("/etc/systemd/system/%s", svc),     // takes precedence
-		fmt.Sprintf("/usr/lib/systemd/system/%s", svc), // pkg default
-	}
-	if obj.Session {
-		// user svc
-		u, err := user.Current()
-		if err != nil {
-			return nil, errwrap.Wrapf(err, "error getting current user")
-		}
-		if u.HomeDir == "" {
-			return nil, fmt.Errorf("user has no home directory")
-		}
-		svcFiles = []string{
-			path.Join(u.HomeDir, "/.config/systemd/user/", svc),
-		}
-	}
-	for _, x := range svcFiles {
-		var reversed = true
-		data = append(data, &FileUID{
-			BaseUID: engine.BaseUID{
-				Name:     obj.Name(),
-				Kind:     obj.Kind(),
-				Reversed: &reversed,
-			},
-			path: x, // what matters
-		})
-	}
-
-	fileEdge := &FileResAutoEdges{
-		data:    data,
-		pointer: 0,
-		found:   false,
-	}
-	cronEdge := &SvcResAutoEdgesCron{
-		session: obj.Session,
-		unit:    svc,
-	}
-
-	return engineUtil.AutoEdgeCombiner(fileEdge, cronEdge)
-}
-
-// UIDs includes all params to make a unique identification of this object. Most
-// resources only return one, although some resources can return multiple.
-func (obj *SvcRes) UIDs() []engine.ResUID {
-	x := &SvcUID{
-		BaseUID: engine.BaseUID{Name: obj.Name(), Kind: obj.Kind()},
-		name:    obj.Name(),  // svc name
-		session: obj.Session, // user session
-	}
-	return []engine.ResUID{x}
-}
-
-// GroupCmp returns whether two resources can be grouped together or not.
-//func (obj *SvcRes) GroupCmp(r engine.GroupableRes) error {
-//	_, ok := r.(*SvcRes)
-//	if !ok {
-//		return fmt.Errorf("resource is not the same kind")
-//	}
-//	// TODO: depending on if the systemd service api allows batching, we
-//	// might be able to build this, although not sure how useful it is...
-//	// it might just eliminate parallelism by bunching up the graph
-//	return fmt.Errorf("not possible at the moment")
-//}
-
-// UnmarshalYAML is the custom unmarshal handler for this struct. It is
-// primarily useful for setting the defaults.
-func (obj *SvcRes) UnmarshalYAML(unmarshal func(interface{}) error) error {
-	type rawRes SvcRes // indirection to avoid infinite recursion
-
-	def := obj.Default()     // get the default
-	res, ok := def.(*SvcRes) // put in the right format
-	if !ok {
-		return fmt.Errorf("could not convert to SvcRes")
-	}
-	raw := rawRes(*res) // convert; the defaults go here
-
-	if err := unmarshal(&raw); err != nil {
-		return err
-	}
-
-	*obj = SvcRes(raw) // restore from indirection with type conversion!
-	return nil
 }

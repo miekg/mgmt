@@ -1,0 +1,31 @@
+-- main.mcl --
+import "golang"
+import "iter"
+
+$fn1 = func($x, $y) {
+	$x + $y
+}
+
+# 3-arg variant with an empty list returns the initial value.
+$in1 = []
+$out1 = iter.reduce(42, $in1, $fn1)
+
+# 2-arg variant with a single element returns that element directly.
+$in2 = [7]
+$out2 = iter.reduce($in2, $fn1)
+
+# 3-arg variant with a single element folds initval and that element.
+$in3 = [10]
+$out3 = iter.reduce(5, $in3, $fn1)
+
+$t1 = golang.template("out1: {{ . }}", $out1)
+$t2 = golang.template("out2: {{ . }}", $out2)
+$t3 = golang.template("out3: {{ . }}", $out3)
+
+test "${t1}" {}
+test "${t2}" {}
+test "${t3}" {}
+-- OUTPUT --
+Vertex: test[out1: 42]
+Vertex: test[out2: 7]
+Vertex: test[out3: 15]

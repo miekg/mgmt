@@ -1,0 +1,8 @@
+-- main.mcl --
+import "map"
+
+$map1 map{int: str} = {42 => "hello1"}
+$name1 = map.lookup($map1, 13)
+test "${name1}" {}
+-- OUTPUT --
+# err: errStream: map key not present, want: 13 in {42: "hello1"}: /main.mcl @ 4:10-4:31

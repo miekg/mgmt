@@ -246,6 +246,7 @@ func (obj *HTTPServerRes) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		obj.init.Logf("Got file at root: %s", p)
 	}
 
+	//nolint:gosec // G703: p is validated against Root above (HasPrefix + optional SecureJoin)
 	handle, err := os.Open(p)
 	if err != nil {
 		obj.init.Logf("could not open: %s", p)
@@ -326,15 +327,18 @@ func (obj *HTTPServerRes) Init(init *engine.Init) error {
 		r := res // bind the variable!
 
 		obj.eventsChanMap[r] = make(chan error)
-		event := func() {
+		event := func(ctx context.Context) error {
 			select {
 			case obj.eventsChanMap[r] <- nil:
-				// send!
+				return nil
+
+			case <-ctx.Done():
+				return ctx.Err()
 			}
 			// We don't do this here (why?) we instead read from the
 			// above channel and then send on multiplexedChan to the
 			// main loop, where it runs the obj.init.Event function.
-			//obj.init.Event() // notify engine of an event (this can block)
+			//if err := obj.init.Event(ctx); err != nil { return err }
 		}
 
 		newInit := &engine.Init{
@@ -343,8 +347,7 @@ func (obj *HTTPServerRes) Init(init *engine.Init) error {
 			Hostname: obj.init.Hostname,
 
 			// Watch:
-			Running: event,
-			Event:   event,
+			Event: event,
 
 			// CheckApply:
 			Refresh: func() bool {
@@ -383,11 +386,20 @@ func (obj *HTTPServerRes) Init(init *engine.Init) error {
 
 // Cleanup is run by the engine to clean up after the resource is done.
 func (obj *HTTPServerRes) Cleanup() error {
-	return nil
+	var result error
+	for _, res := range obj.GetGroup() {
+		if err := res.Cleanup(); err != nil {
+			result = errwrap.Append(result, err)
+		}
+	}
+	return result
 }
 
 // Watch is the primary listener for this resource and it outputs events.
 func (obj *HTTPServerRes) Watch(ctx context.Context) error {
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(context.Canceled)
+
 	// TODO: I think we could replace all this with:
 	//obj.conn, err := net.Listen("tcp", obj.getAddress())
 	// ...but what is the advantage?
@@ -420,6 +432,11 @@ func (obj *HTTPServerRes) Watch(ctx context.Context) error {
 		Handler:      obj.serveMux,
 		ReadTimeout:  time.Duration(readTimeout) * time.Second,
 		WriteTimeout: time.Duration(writeTimeout) * time.Second,
+		BaseContext: func(net.Listener) context.Context {
+			// This means that our ctx will get used as the parent
+			// for all the requests. Closing this cancels them all!
+			return ctx
+		},
 		//MaxHeaderBytes: 1 << 20, XXX: should we add a param for this?
 	}
 
@@ -434,15 +451,20 @@ func (obj *HTTPServerRes) Watch(ctx context.Context) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			defer close(obj.eventsChanMap[res]) // where Watch sends events
-			if err := res.Watch(ctx); err != nil {
+			err := res.Watch(ctx)
+			// Close this channel *before* we report the error. This
+			// is where this Watch is writing to but it is also used
+			// as a "startup" signal, so make sure we do this first,
+			// and avoid any possible deadlocks later down the line!
+			close(obj.eventsChanMap[res]) // where Watch sends events
+			if err != nil {
 				select {
 				case multiplexedChan <- err:
 				case <-ctx.Done():
 				}
 			}
 		}()
-		// wait for Watch first Running() call or immediate error...
+		// wait for Watch first Event() call or immediate error/exit...
 		select {
 		case <-obj.eventsChanMap[res]: // triggers on start or on err...
 		}
@@ -472,10 +494,9 @@ func (obj *HTTPServerRes) Watch(ctx context.Context) error {
 	}
 	// we block until all the children are started first...
 
-	obj.init.Running() // when started, notify engine that we're running
-
-	var closeError error
-	closeSignal := make(chan struct{})
+	if err := obj.init.Event(ctx); err != nil {
+		return err
+	}
 
 	shutdownChan := make(chan struct{}) // server shutdown finished signal
 	wg.Add(1)
@@ -485,7 +506,7 @@ func (obj *HTTPServerRes) Watch(ctx context.Context) error {
 		case <-obj.interruptChan:
 			// TODO: should we bubble up the error from Close?
 			// TODO: do we need a mutex around this Close?
-			obj.server.Close() // kill it quickly!
+			_ = obj.server.Close() // kill it quickly!
 		case <-shutdownChan:
 			// let this exit
 		}
@@ -494,14 +515,13 @@ func (obj *HTTPServerRes) Watch(ctx context.Context) error {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		defer close(closeSignal)
 
 		err := obj.server.Serve(obj.conn) // blocks until Shutdown() is called!
 		if err == nil || err == http.ErrServerClosed {
+			cancel(nil)
 			return
 		}
-		// if this returned on its own, then closeSignal can be used...
-		closeError = errwrap.Wrapf(err, "the server errored")
+		cancel(errwrap.Wrapf(err, "the server errored"))
 	}()
 
 	// When Shutdown is called, Serve, ListenAndServe, and ListenAndServeTLS
@@ -512,6 +532,7 @@ func (obj *HTTPServerRes) Watch(ctx context.Context) error {
 		innerCtx := context.Background()
 		if i := obj.getShutdownTimeout(); i != nil && *i > 0 {
 			var cancel context.CancelFunc
+			//nolint:gosec // G115: shutdown timeout is trusted operator config in s; only wraps above 2^63
 			innerCtx, cancel = context.WithTimeout(innerCtx, time.Duration(*i)*time.Second)
 			defer cancel()
 		}
@@ -519,12 +540,9 @@ func (obj *HTTPServerRes) Watch(ctx context.Context) error {
 		if err == context.DeadlineExceeded {
 			// TODO: should we bubble up the error from Close?
 			// TODO: do we need a mutex around this Close?
-			obj.server.Close() // kill it now
+			_ = obj.server.Close() // kill it now
 		}
 	}()
-
-	startupChan := make(chan struct{})
-	close(startupChan) // send one initial signal
 
 	for {
 		if obj.init.Debug {
@@ -532,9 +550,6 @@ func (obj *HTTPServerRes) Watch(ctx context.Context) error {
 		}
 
 		select {
-		case <-startupChan:
-			startupChan = nil
-
 		case err, ok := <-multiplexedChan:
 			if !ok { // shouldn't happen
 				multiplexedChan = nil
@@ -544,14 +559,13 @@ func (obj *HTTPServerRes) Watch(ctx context.Context) error {
 				return err
 			}
 
-		case <-closeSignal: // something shut us down early
-			return closeError
-
 		case <-ctx.Done(): // closed by the engine to signal shutdown
-			return nil
+			return ctx.Err()
 		}
 
-		obj.init.Event() // notify engine of an event (this can block)
+		if err := obj.init.Event(ctx); err != nil {
+			return err
+		}
 	}
 }
 

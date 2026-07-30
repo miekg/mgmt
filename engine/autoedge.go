@@ -30,6 +30,7 @@
 package engine
 
 import (
+	"context"
 	"fmt"
 )
 
@@ -54,7 +55,7 @@ type EdgeableRes interface {
 	// AutoEdges returns a struct that implements the AutoEdge interface.
 	// This interface can be used to generate automatic edges to other
 	// resources.
-	AutoEdges() (AutoEdge, error)
+	AutoEdges(ctx context.Context) (AutoEdge, error)
 }
 
 // AutoEdgeMeta provides some parameters specific to automatic edges.
@@ -91,6 +92,19 @@ type ResUID interface {
 	IFF(ResUID) bool
 
 	IsReversed() bool // true means this resource happens before the generator
+}
+
+// ResUIDHashable is an optional extension of the ResUID interface. A UID which
+// implements it, promises that for any two UID's of the same concrete type,
+// UIDHash() returns equal strings if and only if IFF() would match them. This
+// allows the autoedge matching to find candidates with a hash lookup instead of
+// a linear scan. Only implement this if your IFF method is a pure equality
+// comparison of some value, such as a path.
+type ResUIDHashable interface {
+	ResUID
+
+	// UIDHash returns the matching identity of this UID as a string.
+	UIDHash() string
 }
 
 // The BaseUID struct is used to provide a unique resource identifier.

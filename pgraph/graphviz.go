@@ -180,11 +180,11 @@ func (obj *Graphviz) Exec(ctx context.Context) error {
 	uid, err1 := strconv.Atoi(os.Getenv("SUDO_UID"))
 	gid, err2 := strconv.Atoi(os.Getenv("SUDO_GID"))
 
-	if err := os.WriteFile(filename, []byte(obj.Text()), 0644); err != nil {
+	if err := os.WriteFile(filename, []byte(obj.Text()), 0600); err != nil {
 		return errwrap.Wrapf(err, "error writing to filename")
 	}
 
-	if err1 == nil && err2 == nil {
+	if err1 == nil && err2 == nil && uid >= 0 && gid >= 0 {
 		if err := os.Chown(filename, uid, gid); err != nil {
 			return errwrap.Wrapf(err, "error changing file owner")
 		}
@@ -198,11 +198,11 @@ func (obj *Graphviz) Exec(ctx context.Context) error {
 	out := fmt.Sprintf("%s.png", filename)
 	cmd := exec.CommandContext(ctx, path, "-Tpng", fmt.Sprintf("-o%s", out), filename)
 
-	if err1 == nil && err2 == nil {
+	if err1 == nil && err2 == nil && uid >= 0 && gid >= 0 {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 		cmd.SysProcAttr.Credential = &syscall.Credential{
-			Uid: uint32(uid),
-			Gid: uint32(gid),
+			Uid: uint32(uid), //nolint:gosec // G115: guarded non-negative above
+			Gid: uint32(gid), //nolint:gosec // G115: guarded non-negative above
 		}
 	}
 
@@ -242,13 +242,13 @@ func (obj *Graph) graphvizBody(opts *GraphvizOpts) string {
 		}
 
 		vs := []Vertex{}
-		for j := range obj.Adjacency()[i] {
+		for j := range obj.adjacency[i] {
 			vs = append(vs, j)
 		}
-		sort.Sort(VertexSlice(vs)) // deterministic order
+		VertexSlice(vs).Sort() // deterministic order
 
 		for _, j := range vs {
-			k := obj.Adjacency()[i][j]
+			k := obj.adjacency[i][j]
 			//v2 := html.EscapeString(j.String()) // 2nd vertex
 			e := html.EscapeString(k.String()) // edge
 			// use str for clearer output ordering

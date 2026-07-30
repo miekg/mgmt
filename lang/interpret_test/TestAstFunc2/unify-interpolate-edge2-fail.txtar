@@ -1,5 +1,5 @@
 -- main.mcl --
-$name = ["a", "bb", "ccc",]
+$name = ["a", "bb", "ccc"]
 test $name {}
 test "test" {}
 
@@ -8,3 +8,7 @@ Test["test"] -> Test["${name}"] # must fail
 
 -- OUTPUT --
 # err: errUnify: type error: str != list: /main.mcl @ 6:17-6:32
+type error: str != list: /main.mcl @ 6:17-6:32
+
+Test["test"] -> Test["${name}"] # must fail
+                ^^^^^^^^^^^^^^^

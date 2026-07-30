@@ -33,26 +33,68 @@ import (
 	"context"
 	"net"
 
-	"github.com/purpleidea/mgmt/lang/funcs/simple"
+	"github.com/purpleidea/mgmt/lang/funcs"
+	"github.com/purpleidea/mgmt/lang/interfaces"
 	"github.com/purpleidea/mgmt/lang/types"
 )
 
+const (
+	// MacsFuncName is the name this function is registered as.
+	MacsFuncName = "macs"
+)
+
 func init() {
-	simple.ModuleRegister(ModuleName, "macs", &simple.Scaffold{
-		I: &simple.Info{
-			Pure: false,
-			Memo: false,
-			Fast: false,
-			Spec: false, // might be different at real runtime
-		},
-		T: types.NewType("func() []str"),
-		F: Macs,
+	funcs.ModuleRegister(ModuleName, MacsFuncName, func() interfaces.Func {
+		return &MacsFunc{}
 	})
 }
 
-// Macs returns the list of mac addresses that are seen on the machine.
-//
-// XXX: These should produce new values if the list of interfaces change.
+// MacsFunc returns the visible MAC addresses and streams events when network
+// links or addresses change.
+type MacsFunc struct {
+	interfaces.Textarea
+
+	init *interfaces.Init
+}
+
+// String returns a simple name for this function.
+func (obj *MacsFunc) String() string {
+	return MacsFuncName
+}
+
+// Validate makes sure the function was built correctly.
+func (obj *MacsFunc) Validate() error {
+	return nil
+}
+
+// Info returns static information about this function.
+func (obj *MacsFunc) Info() *interfaces.Info {
+	return &interfaces.Info{
+		Pure: false,
+		Memo: false,
+		Fast: false,
+		Spec: false,
+		Sig:  types.NewType("func() []str"),
+	}
+}
+
+// Init initializes this function.
+func (obj *MacsFunc) Init(init *interfaces.Init) error {
+	obj.init = init
+	return nil
+}
+
+// Stream emits an initial event and subsequent network change events.
+func (obj *MacsFunc) Stream(ctx context.Context) error {
+	return networkEventStream(ctx, obj.init.Event)
+}
+
+// Call returns the current visible MAC addresses.
+func (obj *MacsFunc) Call(ctx context.Context, args []types.Value) (types.Value, error) {
+	return Macs(ctx, args)
+}
+
+// Macs returns the list of MAC addresses that are seen on the machine.
 func Macs(ctx context.Context, input []types.Value) (types.Value, error) {
 	ifs, err := net.Interfaces()
 	if err != nil {

@@ -46,10 +46,10 @@ import (
 )
 
 const (
-	// MaxServerStartTimeout is the amount of time to wait for the server
-	// to start before considering it a failure. If you hit this timeout,
-	// let us know so that we can analyze the situation, and increase this
-	// if necessary.
+	// MaxServerStartTimeout is the amount of time to wait for the server to
+	// start before considering it a failure. If you hit this timeout, let
+	// us know so that we can analyze the situation, and increase this if
+	// necessary.
 	MaxServerStartTimeout = 60 * time.Second
 
 	// MaxServerCloseTimeout is the maximum amount of time we'll wait for
@@ -74,7 +74,7 @@ func (obj *EmbdEtcd) runServer(ctx context.Context, newCluster bool, peerURLsMap
 	defer obj.Logf("server: runServer: done!")
 	defer obj.serverExitsSignal.Send()
 	dataDir := fmt.Sprintf("%s/", path.Join(obj.Prefix, "server"))
-	if err := os.MkdirAll(dataDir, 0770); err != nil {
+	if err := os.MkdirAll(dataDir, 0750); err != nil {
 		return errwrap.Wrapf(err, "couldn't mkdir: %s", dataDir)
 	}
 

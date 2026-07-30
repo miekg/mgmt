@@ -38,12 +38,14 @@ import (
 	"syscall"
 
 	cliUtil "github.com/purpleidea/mgmt/cli/util"
+	etcdfs "github.com/purpleidea/mgmt/etcd/fs"
 	"github.com/purpleidea/mgmt/gapi"
 	"github.com/purpleidea/mgmt/lib"
 	"github.com/purpleidea/mgmt/util"
 	"github.com/purpleidea/mgmt/util/errwrap"
 	. "github.com/purpleidea/mgmt/util/gettext"
 
+	"github.com/google/uuid"
 	"github.com/spf13/afero"
 )
 
@@ -53,11 +55,9 @@ import (
 type RunArgs struct {
 	lib.Config // embedded config (can't be a pointer) https://github.com/alexflint/go-arg/issues/240
 
-	RunEmpty      *cliUtil.EmptyArgs      `arg:"subcommand:empty" help:"run empty payload"`
-	RunLang       *cliUtil.LangArgs       `arg:"subcommand:lang" help:"run lang (mcl) payload"`
-	RunYaml       *cliUtil.YamlArgs       `arg:"subcommand:yaml" help:"run yaml graph payload"`
-	RunPuppet     *cliUtil.PuppetArgs     `arg:"subcommand:puppet" help:"run puppet graph payload"`
-	RunLangPuppet *cliUtil.LangPuppetArgs `arg:"subcommand:langpuppet" help:"run a combined lang/puppet graph payload"`
+	RunEmpty *cliUtil.EmptyArgs `arg:"subcommand:empty" help:"run empty payload"`
+	RunLang  *cliUtil.LangArgs  `arg:"subcommand:lang" help:"run lang (mcl) payload"`
+	RunYaml  *cliUtil.YamlArgs  `arg:"subcommand:yaml" help:"run yaml graph payload"`
 }
 
 // Run executes the correct subcommand. It errors if there's ever an error. It
@@ -84,15 +84,6 @@ func (obj *RunArgs) Run(ctx context.Context, data *cliUtil.Data) (bool, error) {
 		name = cliUtil.LookupSubcommand(obj, cmd) // "yaml"
 		args = cmd
 	}
-	if cmd := obj.RunPuppet; cmd != nil {
-		name = cliUtil.LookupSubcommand(obj, cmd) // "puppet"
-		args = cmd
-	}
-	if cmd := obj.RunLangPuppet; cmd != nil {
-		name = cliUtil.LookupSubcommand(obj, cmd) // "langpuppet"
-		args = cmd
-	}
-
 	// XXX: workaround https://github.com/alexflint/go-arg/issues/239
 	lists := [][]string{
 		obj.Seeds,
@@ -129,10 +120,22 @@ func (obj *RunArgs) Run(ctx context.Context, data *cliUtil.Data) (bool, error) {
 	cliUtil.Hello(main.Program, main.Version, data.Flags) // say hello!
 	defer Logf(G("goodbye!"))
 
-	// create a memory backed temporary filesystem for storing runtime data
+	// TODO: using a uuid is meant as a temporary measure, i hate them
+	uniqueid := uuid.New() // panic's if it can't generate one :P
+	metadata := lib.MetadataPrefix + fmt.Sprintf("/deploy/%s", uniqueid)
+
+	// Create a memory backed temporary filesystem for storing runtime data.
+	// The files are staged here, and the URI points to where they will get
+	// copied to in the cluster fs, so that our initial deploy is a true
+	// deploy, which is identical to what the `deploy` command produces, and
+	// which any other cluster member can therefore find and run as well.
 	mmFs := afero.NewMemMapFs()
 	afs := &afero.Afero{Fs: mmFs} // wrap so that we're implementing ioutil
-	standaloneFs := &util.AferoFs{Afero: afs}
+	standaloneFs := &util.AferoFs{
+		Afero:  afs,
+		Scheme: etcdfs.Scheme,
+		Path:   metadata,
+	}
 	main.DeployFs = standaloneFs
 
 	info := &gapi.Info{
@@ -144,6 +147,7 @@ func (obj *RunArgs) Run(ctx context.Context, data *cliUtil.Data) (bool, error) {
 			//Update: obj.Update,
 
 			NoAutoEdges: obj.NoAutoEdges,
+			NoAutoGroup: obj.NoAutoGroup,
 		},
 
 		Fs:    standaloneFs,

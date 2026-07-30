@@ -33,6 +33,7 @@
 package graph
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path"
@@ -44,6 +45,7 @@ import (
 	"github.com/purpleidea/mgmt/engine/local"
 	engineUtil "github.com/purpleidea/mgmt/engine/util"
 	"github.com/purpleidea/mgmt/pgraph"
+	"github.com/purpleidea/mgmt/util"
 	"github.com/purpleidea/mgmt/util/errwrap"
 	"github.com/purpleidea/mgmt/util/semaphore"
 )
@@ -54,7 +56,13 @@ const (
 	StateDir = "state"
 )
 
-// Engine encapsulates a generic graph and manages its operations.
+// Engine encapsulates a generic graph and manages its operations. The engine
+// starts off running (unpaused) but with an empty graph. It then cycles through
+// being paused, gets vertices added, and then (unpause) resuming. The vertices
+// have state which includes the running Worker (Watch for Res) and those start
+// paused, which resume and start up after Commit. Getting the architectural
+// dance right and knowing what starts paused vs running was tricky, but I think
+// it's correct now.
 type Engine struct {
 	Program  string
 	Version  string
@@ -66,6 +74,8 @@ type Engine struct {
 
 	Local *local.API
 	World engine.World
+	// TODO: remove Cancel from here since it's part of Local now?
+	Cancel context.CancelCauseFunc
 
 	// Prefix is a unique directory prefix which can be used. It should be
 	// created if needed.
@@ -85,6 +95,8 @@ type Engine struct {
 
 	slock *sync.Mutex // semaphore lock
 	semas map[string]*semaphore.Semaphore
+
+	bgState map[string]*bgState // background state for each resource kind
 
 	wg *sync.WaitGroup // wg for the whole engine (only used for close)
 
@@ -115,6 +127,7 @@ func (obj *Engine) Init() error {
 		return fmt.Errorf("the prefix of `%s` is invalid", obj.Prefix)
 	}
 	// 0775 since we want children to be able to read this!
+	//nolint:gosec // G301: children must be able to read this prefix
 	if err := os.MkdirAll(obj.Prefix, 0775); err != nil {
 		return errwrap.Wrapf(err, "can't create prefix")
 	}
@@ -130,9 +143,11 @@ func (obj *Engine) Init() error {
 	obj.slock = &sync.Mutex{}
 	obj.semas = make(map[string]*semaphore.Semaphore)
 
+	obj.bgState = make(map[string]*bgState)
+
 	obj.wg = &sync.WaitGroup{}
 
-	obj.paused = true // start off true, so we can Resume after first Commit
+	//obj.paused = false // start off running (but empty)
 	obj.fastPause = &atomic.Bool{}
 
 	obj.errMutex = &sync.Mutex{}
@@ -199,12 +214,14 @@ func (obj *Engine) Apply(fn func(*pgraph.Graph) error) error {
 // Commit runs a graph sync and swaps the loaded graph with the current one. If
 // it errors, then the running graph wasn't changed. It is recommended that you
 // pause the engine before running this, and resume it after you're done.
-func (obj *Engine) Commit() error {
+func (obj *Engine) Commit(ctx context.Context) error {
 	// It would be safer to lock this, but it would be slower and mask bugs.
 	//obj.mutex.Lock()
 	//defer obj.mutex.Unlock()
 
 	// TODO: Does this hurt performance or graph changes ?
+
+	backgroundKinds := make(map[string]int)
 
 	activeMetas := make(map[engine.ResPtrUID]struct{})
 	for vertex := range obj.state {
@@ -216,6 +233,10 @@ func (obj *Engine) Commit() error {
 		// the same kind+name as a regular res, and this would conflict.
 		if res.MetaParams().Hidden {
 			continue
+		}
+
+		if _, ok := res.(engine.BackgroundRes); ok {
+			backgroundKinds[res.Kind()]++
 		}
 
 		activeMetas[engine.PtrUID(res)] = struct{}{} // add
@@ -265,7 +286,11 @@ func (obj *Engine) Commit() error {
 
 		obj.waits[vertex] = &sync.WaitGroup{}
 		obj.state[vertex] = &State{
-			Graph:  obj.graph, // Update if we swap the graph!
+			// XXX: We are building a new node but it's getting the
+			// old graph right away? We do set it at the end of the
+			// commit, maybe make it nil right now and avoid that?
+			//Graph: obj.graph,
+			Graph:  nil, // Update if we swap the graph!
 			Vertex: vertex,
 
 			Program:  obj.Program,
@@ -281,6 +306,8 @@ func (obj *Engine) Commit() error {
 			Logf: func(format string, v ...interface{}) {
 				obj.Logf(res.String()+": "+format, v...)
 			},
+
+			//paused: true, // start paused (set in Init)
 		}
 		if err := obj.state[vertex].Init(); err != nil {
 			return errwrap.Wrapf(err, "the Res did not Init")
@@ -306,7 +333,13 @@ func (obj *Engine) Commit() error {
 				if obj.Debug {
 					obj.Logf("%s: Working...", v)
 				}
-				// contains the Watch and CheckApply loops
+				// This contains the Watch and CheckApply loops!
+				// When we start the Worker, Watch and then
+				// CheckApply would start running immediately,
+				// even though we're still in Commit and didn't
+				// Resume from Pause yet! This is *not* what we
+				// want. Watch can run but CheckApply must wait,
+				// so Worker makes sure that it starts paused...
 				err := obj.Worker(v)
 				if s := engineUtil.CleanError(err); err != nil {
 					obj.Logf("%s: Error: %s", v, s)
@@ -343,7 +376,14 @@ func (obj *Engine) Commit() error {
 		// wait for exit before starting new graph!
 		close(obj.state[vertex].removeDone)   // causes doneCtx to cancel
 		close(obj.state[vertex].resumeSignal) // unblock (it only closes here)
-		obj.waits[vertex].Wait()              // sync
+
+		// add a watchdog to catch slow exiting or blocked resources
+		watchdogFn := func(msg string) {
+			obj.Logf("res: %s: %s", res, msg)
+		}
+		cancel := util.WatchdogFn(watchdogFn)
+		obj.waits[vertex].Wait() // sync
+		cancel()
 
 		// close the state and resource
 		// FIXME: will this mess up the sync and block the engine?
@@ -426,6 +466,28 @@ func (obj *Engine) Commit() error {
 	}
 	obj.mlock.Unlock()
 
+	// Run StartBackground here before the Watch() for each resource starts.
+	// That Watch starts in the start loop below... We want the background
+	// up first since Watch might want to use something from the Background.
+	for _, vertex := range obj.graph.Vertices() { // TODO: sorted order?
+		res, ok := vertex.(engine.Res)
+		if !ok { // should not happen, previously validated
+			return fmt.Errorf("not a Res")
+		}
+
+		// don't start background if it's not supported or it's hidden!
+		if _, ok := res.(engine.BackgroundRes); !ok || res.MetaParams().Hidden {
+			continue
+		}
+		kind := res.Kind()
+
+		if err := obj.StartBackground(ctx, kind); err != nil {
+			obj.Logf("background(%s) start error: %v", kind, err)
+			return errwrap.Wrapf(err, "error starting background")
+		}
+		delete(backgroundKinds, kind) // don't need to start it anymore
+	}
+
 	// We run these afterwards, so that we don't unnecessarily start anyone
 	// if GraphSync failed in some way. Otherwise we'd have to do clean up!
 	for _, fn := range start {
@@ -448,6 +510,11 @@ func (obj *Engine) Commit() error {
 
 	// Update all the `State` structs with the new Graph pointer.
 	for _, vertex := range obj.graph.Vertices() {
+		_, ok := vertex.(engine.Res)
+		if !ok { // should not happen, previously validated
+			return fmt.Errorf("not a Res")
+		}
+
 		state, exists := obj.state[vertex]
 		if !exists {
 			continue
@@ -455,20 +522,35 @@ func (obj *Engine) Commit() error {
 		state.Graph = obj.graph // update pointer to graph
 	}
 
+	// Stop anything remaining here since they're not in the resource graph.
+	// The Watch functions of this kind must be done running by the time we
+	// run this cleanup! This prevents race conditions between the two...
+	for kind := range backgroundKinds {
+		if err := obj.StopBackground(kind); err != nil {
+			// TODO: should we shutdown the engine?
+			obj.Logf("background(%s) stop error: %v", kind, err)
+			// XXX: collect all stop errors and return them together?
+			return errwrap.Wrapf(err, "error stopping background")
+		}
+	}
+
 	return nil
 }
 
-// Resume runs the currently active graph. It also un-pauses the graph if it was
-// paused. Very little that is interesting should happen here. It all happens in
-// the Commit method. After Commit, new things are already started, but we still
-// need to Resume any pre-existing resources. Do not call this concurrently with
-// the Pause method.
+// Resume un-pauses the active graph. Very little that is interesting should
+// happen here. It all happens in the Commit method. During Commit, the Worker
+// method starts which in turn causes Watch to start, however the main body of
+// the Worker starts in a paused mode. It waits for the resume signal before it
+// lets CheckApply run for the first time. No CheckApply methods may run when we
+// are paused. This also needs to Resume any pre-existing resources. Do not call
+// this concurrently with the Pause method.
 func (obj *Engine) Resume() error {
 	// It would be safer to lock this, but it would be slower and mask bugs.
 	//obj.mutex.Lock()
 	//defer obj.mutex.Unlock()
 
 	if !obj.paused {
+		// programming error
 		return fmt.Errorf("already resumed")
 	}
 
@@ -485,13 +567,11 @@ func (obj *Engine) Resume() error {
 		// more convenient to just have a state struct field (paused) to
 		// track things for this instead. As a bonus, it helps us know
 		// if a resource is paused or not if we print for debugging.
-		//if !obj.state[vertex].initialStartupDone {
-		//	obj.state[vertex].initialStartupDone = true
-		//	continue
-		//}
 
 		//obj.state[vertex].starter = (indegree[vertex] == 0)
-		obj.state[vertex].Resume() // doesn't error
+		if err := obj.state[vertex].Resume(); err != nil && err != engine.ErrClosed {
+			return err
+		}
 		// This always works because if a resource errored while it was
 		// paused, then we're in the paused state and we can still exit
 		// from there. If a resource errors when we're trying to Pause
@@ -521,6 +601,7 @@ func (obj *Engine) Pause(fastPause bool) error {
 	//defer obj.mutex.Unlock()
 
 	if obj.paused {
+		// programming error
 		return fmt.Errorf("already paused")
 	}
 
@@ -554,7 +635,15 @@ func (obj *Engine) Shutdown() error {
 	}
 	// FIXME: Do we want to run commit if Load failed? Does this even work?
 	// the commit will cause the graph sync to shut things down cleverly...
-	if err := obj.Commit(); err != nil {
+	// Don't cancel this context, because we want to shut down cleanly!
+	if err := obj.Commit(context.Background()); err != nil {
+		reterr = errwrap.Append(reterr, err)
+	}
+
+	// check to make sure all the background functions are done running!
+	if d := len(obj.bgState); d > 0 {
+		// programming error
+		err := fmt.Errorf("%d background functions didn't exit", d)
 		reterr = errwrap.Append(reterr, err)
 	}
 

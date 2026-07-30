@@ -49,8 +49,7 @@ import (
 )
 
 const (
-	// CPUCountFuncName is the name this fact is registered as. It's still a
-	// Func Name because this is the name space the fact is actually using.
+	// CPUCountFuncName is the name this func is registered as.
 	CPUCountFuncName = "cpu_count"
 
 	rtmGrps         = 0x1 // make me a multicast receiver
@@ -59,16 +58,18 @@ const (
 )
 
 func init() {
-	funcs.ModuleRegister(ModuleName, CPUCountFuncName, func() interfaces.Func { return &CPUCount{} }) // must register the fact and name
+	funcs.ModuleRegister(ModuleName, CPUCountFuncName, func() interfaces.Func { return &CPUCount{} })
 }
 
-// CPUCount is a fact that returns the current CPU count.
+// CPUCount is a func that returns the current CPU count.
 type CPUCount struct {
+	interfaces.Textarea
+
 	init   *interfaces.Init
 	result types.Value // last calculated output
 }
 
-// String returns a simple name for this fact. This is needed so this struct can
+// String returns a simple name for this func. This is needed so this struct can
 // satisfy the pgraph.Vertex interface.
 func (obj *CPUCount) String() string {
 	return CPUCountFuncName
@@ -79,10 +80,10 @@ func (obj *CPUCount) Validate() error {
 	return nil
 }
 
-// Info returns static typing info about what the fact returns.
+// Info returns static typing info about what the func returns.
 func (obj *CPUCount) Info() *interfaces.Info {
 	return &interfaces.Info{
-		Pure: false, // non-constant facts can't be pure!
+		Pure: false, // non-constant funcs can't be pure!
 		Memo: false,
 		Fast: false,
 		Spec: false,
@@ -90,7 +91,7 @@ func (obj *CPUCount) Info() *interfaces.Info {
 	}
 }
 
-// Init runs startup code for this fact.
+// Init runs startup code for this func.
 func (obj *CPUCount) Init(init *interfaces.Init) error {
 	obj.init = init
 	return nil
@@ -99,7 +100,7 @@ func (obj *CPUCount) Init(init *interfaces.Init) error {
 // Stream starts a mainloop and runs Event when it's time to Call() again. It
 // will first poll sysfs to get the initial cpu count, and then receives UEvents
 // from the kernel as CPUs are added/removed.
-func (obj CPUCount) Stream(ctx context.Context) error {
+func (obj *CPUCount) Stream(ctx context.Context) error {
 	ss, err := socketset.NewSocketSet(rtmGrps, socketFile, unix.NETLINK_KOBJECT_UEVENT)
 	if err != nil {
 		return errwrap.Wrapf(err, "error creating socket set")
@@ -173,7 +174,7 @@ func (obj CPUCount) Stream(ctx context.Context) error {
 	}
 }
 
-// Call this fact and return the value if it is possible to do so at this time.
+// Call this func and return the value if it is possible to do so at this time.
 func (obj *CPUCount) Call(ctx context.Context, args []types.Value) (types.Value, error) {
 	count, err := getCPUCount() // TODO: ctx?
 	if err != nil {
@@ -181,7 +182,7 @@ func (obj *CPUCount) Call(ctx context.Context, args []types.Value) (types.Value,
 	}
 
 	return &types.IntValue{
-		V: int64(count),
+		V: count,
 	}, nil
 
 }

@@ -1,0 +1,15 @@
+import "golang"
+import "iter"
+
+$fn1 = func($x, $y) {
+	$x + $y
+}
+
+$xs = [1, 2, 3, 4, 5]
+$ys = [10, 20, 30, 40, 50]
+
+$out1 = iter.zip($xs, $ys, $fn1) # [11, 22, 33, 44, 55]
+
+$t1 = golang.template("out1: {{ . }}", $out1)
+
+test [$t1] {}

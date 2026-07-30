@@ -27,12 +27,13 @@
 // additional permission if he deems it necessary to achieve the goals of this
 // additional permission.
 
-// Package packagekit provides an interface to interact with packagekit.
+// Package packagekit provides an interface to connect to the packagekit daemon.
 // See: https://www.freedesktop.org/software/PackageKit/gtk-doc/index.html for
 // more information.
 package packagekit
 
 import (
+	"context"
 	"fmt"
 	"runtime"
 	"strings"
@@ -43,11 +44,6 @@ import (
 	"github.com/purpleidea/mgmt/util/errwrap"
 
 	"github.com/godbus/dbus/v5"
-)
-
-// global tweaks of verbosity and code path
-const (
-	Paranoid = false // enable if you see any ghosts
 )
 
 // constants which might need to be tweaked or which contain special dbus
@@ -109,6 +105,79 @@ const ( //static const PkEnumMatch enum_transaction_flag[]
 
 // constants from packagekit c library.
 const ( //typedef enum
+	PkErrorEnumUnknown uint32 = iota
+	PkErrorEnumOOM
+	PkErrorEnumNoNetwork
+	PkErrorEnumNotSupported
+	PkErrorEnumInternalError
+	PkErrorEnumGPGFailure
+	PkErrorEnumPackageIDInvalid
+	PkErrorEnumPackageNotInstalled
+	PkErrorEnumPackageNotFound
+	PkErrorEnumPackageAlreadyInstalled
+	PkErrorEnumPackageDownloadFailed
+	PkErrorEnumGroupNotFound
+	PkErrorEnumGroupListInvalid
+	PkErrorEnumDepResolutionFailed
+	PkErrorEnumFilterInvalid
+	PkErrorEnumCreateThreadFailed
+	PkErrorEnumTransactionError
+	PkErrorEnumTransactionCancelled
+	PkErrorEnumNoCache
+	PkErrorEnumRepoNotFound
+	PkErrorEnumCannotRemoveSystemPackage
+	PkErrorEnumProcessKill
+	PkErrorEnumFailedInitialization
+	PkErrorEnumFailedFinalise
+	PkErrorEnumFailedConfigParsing
+	PkErrorEnumCannotCancel
+	PkErrorEnumCannotGetLock
+	PkErrorEnumNoPackagesToUpdate
+	PkErrorEnumCannotWriteRepoConfig
+	PkErrorEnumLocalInstallFailed
+	PkErrorEnumBadGPGSignature
+	PkErrorEnumMissingGPGSignature
+	PkErrorEnumCannotInstallSourcePackages
+	PkErrorEnumRepoConfigurationError
+	PkErrorEnumNoLicenseAgreement
+	PkErrorEnumFileConflicts
+	PkErrorEnumPackageConflicts
+	PkErrorEnumRepoNotAvailable
+	PkErrorEnumInvalidPackageFile
+	PkErrorEnumPackageInstallBlocked
+	PkErrorEnumPackageCorrupt
+	PkErrorEnumAllPackagesAlreadyInstalled
+	PkErrorEnumFileNotFound
+	PkErrorEnumNoMoreMirrorsToTry
+	PkErrorEnumNoDistroUpgradeData
+	PkErrorEnumIncompatibleArchitecture
+	PkErrorEnumNoSpaceOnDevice
+	PkErrorEnumMediaChangeRequired
+	PkErrorEnumNotAuthorized
+	PkErrorEnumUpdateNotFound
+	PkErrorEnumCannotInstallRepoUnsigned
+	PkErrorEnumCannotUpdateRepoUnsigned
+	PkErrorEnumCannotGetFilelist
+	PkErrorEnumCannotGetRequires
+	PkErrorEnumCannotDisableRepository
+	PkErrorEnumRestrictedDownload
+	PkErrorEnumPackageFailedToConfigure
+	PkErrorEnumPackageFailedToBuild
+	PkErrorEnumPackageFailedToInstall
+	PkErrorEnumPackageFailedToRemove
+	PkErrorEnumUpdateFailedDueToRunningProcess
+	PkErrorEnumPackageDatabaseChanged
+	PkErrorEnumProvideTypeNotSupported
+	PkErrorEnumInstallRootInvalid
+	PkErrorEnumCannotFetchSources
+	PkErrorEnumCancelledPriority
+	PkErrorEnumUnfinishedTransaction
+	PkErrorEnumLockRequired
+	PkErrorEnumRepoAlreadySet
+)
+
+// constants from packagekit c library.
+const ( //typedef enum
 	PkInfoEnumUnknown uint64 = 1 << iota
 	PkInfoEnumInstalled
 	PkInfoEnumAvailable
@@ -138,6 +207,38 @@ const ( //typedef enum
 	PkInfoEnumLast
 )
 
+// PkError is an error emitted by the PackageKit ErrorCode signal.
+type PkError struct {
+	Code    uint32
+	Details string
+}
+
+// Error is the standard function that fulfills the interface.
+func (obj *PkError) Error() string {
+	if obj.Details == "" {
+		return fmt.Sprintf("packagekit error %d", obj.Code)
+	}
+	return fmt.Sprintf("packagekit error %d: %s", obj.Code, obj.Details)
+}
+
+func newPkError(body []interface{}) error {
+	if len(body) != 2 {
+		return fmt.Errorf("error in body: %v", body)
+	}
+	code, ok := body[0].(uint32)
+	if !ok {
+		return fmt.Errorf("error in body: %v", body)
+	}
+	details, ok := body[1].(string)
+	if !ok {
+		return fmt.Errorf("error in body: %v", body)
+	}
+	return &PkError{
+		Code:    code,
+		Details: details,
+	}
+}
+
 // Conn is a wrapper struct so we can pass bus connection around in the struct.
 type Conn struct {
 	conn *dbus.Conn
@@ -157,15 +258,15 @@ type PkPackageIDActionData struct {
 }
 
 // NewBus returns a new bus connection.
-func NewBus() *Conn {
+func NewBus() (*Conn, error) {
 	// if we share the bus with others, we will get each others messages!!
 	bus, err := util.SystemBusPrivateUsable() // don't share the bus connection!
 	if err != nil {
-		return nil
+		return nil, errwrap.Wrapf(err, "can't connect to system bus")
 	}
 	return &Conn{
 		conn: bus,
-	}
+	}, nil
 }
 
 // GetBus gets the dbus connection object.
@@ -187,8 +288,14 @@ func (obj *Conn) matchSignal(ch chan *dbus.Signal, path dbus.ObjectPath, iface s
 	// eg: gdbus monitor --system --dest org.freedesktop.PackageKit --object-path /org/freedesktop/PackageKit | grep <signal>
 	bus := obj.GetBus().BusObject()
 	var argsList []string
+	signalRegistered := false
 	// cleanup function should be called when done or when AddMatch errors
 	removeSignals := func() error {
+		// Unregister ch from godbus first so no more signals are
+		// dispatched to it, then drop the bus-daemon match rules.
+		if signalRegistered {
+			obj.GetBus().RemoveSignal(ch)
+		}
 		var errList error
 		for i := len(argsList) - 1; i >= 0; i-- { // last in first out
 			call := bus.Call(engineUtil.DBusRemoveMatch, 0, argsList[i])
@@ -221,11 +328,14 @@ func (obj *Conn) matchSignal(ch chan *dbus.Signal, path dbus.ObjectPath, iface s
 	// message arrives when a write to c is not possible, it is discarded!
 	// This can be disastrous if we're waiting for a "Finished" signal!
 	obj.GetBus().Signal(ch)
+	signalRegistered = true
 	return removeSignals, nil
 }
 
-// WatchChanges gets a signal anytime an event happens.
-func (obj *Conn) WatchChanges() (chan *dbus.Signal, error) {
+// WatchChanges gets a signal anytime an event happens. The caller must invoke
+// the returned cleanup function when it is done watching, or signal matches and
+// channel registrations will leak.
+func (obj *Conn) WatchChanges() (chan *dbus.Signal, func() error, error) {
 	ch := make(chan *dbus.Signal, PkBufferSize)
 	// NOTE: the TransactionListChanged signal fires much more frequently,
 	// but with much less specificity. If we're missing events, report the
@@ -233,38 +343,9 @@ func (obj *Conn) WatchChanges() (chan *dbus.Signal, error) {
 	var signal = "UpdatesChanged"
 	removeSignals, err := obj.matchSignal(ch, PkPath, PkIface, []string{signal})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	defer removeSignals() // ignore the error
-	if Paranoid {         // TODO: this filtering might not be necessary anymore...
-		// try to handle the filtering inside this function!
-		rch := make(chan *dbus.Signal)
-		go func() {
-		loop:
-			for {
-				select {
-				case event := <-ch:
-					// "A receive from a closed channel returns the
-					// zero value immediately": if i get nil here,
-					// it means the channel was closed by someone!!
-					if event == nil { // shared bus issue?
-						obj.Logf("Hrm, channel was closed!")
-						break loop // TODO: continue?
-					}
-					// i think this was caused by using the shared
-					// bus, but we might as well leave it in for now
-					if event.Path != PkPath || event.Name != fmt.Sprintf("%s.%s", PkIface, signal) {
-						obj.Logf("Woops: Event: %+v", event)
-						continue
-					}
-					rch <- event // forward...
-				}
-			}
-			defer close(ch)
-		}()
-		return rch, nil
-	}
-	return ch, nil
+	return ch, removeSignals, nil
 }
 
 // CreateTransaction creates and returns a transaction path.
@@ -274,10 +355,14 @@ func (obj *Conn) CreateTransaction() (dbus.ObjectPath, error) {
 	}
 	var interfacePath dbus.ObjectPath
 	bus := obj.GetBus().Object(PkIface, PkPath)
-	call := bus.Call(fmt.Sprintf("%s.CreateTransaction", PkIface), 0).Store(&interfacePath)
-	if call != nil {
-		return "", call
+	call := bus.Call(fmt.Sprintf("%s.CreateTransaction", PkIface), 0)
+	if call.Err != nil {
+		return "", call.Err
 	}
+	if err := call.Store(&interfacePath); err != nil {
+		return "", err
+	}
+
 	if obj.Debug {
 		obj.Logf("CreateTransaction(): %v", interfacePath)
 	}
@@ -285,7 +370,7 @@ func (obj *Conn) CreateTransaction() (dbus.ObjectPath, error) {
 }
 
 // ResolvePackages runs the PackageKit Resolve method and returns the result.
-func (obj *Conn) ResolvePackages(packages []string, filter uint64) ([]string, error) {
+func (obj *Conn) ResolvePackages(ctx context.Context, packages []string, filter uint64) ([]string, error) {
 	packageIDs := []string{}
 	ch := make(chan *dbus.Signal, PkBufferSize)   // we need to buffer :(
 	interfacePath, err := obj.CreateTransaction() // emits Destroy on close
@@ -294,7 +379,7 @@ func (obj *Conn) ResolvePackages(packages []string, filter uint64) ([]string, er
 	}
 
 	// add signal matches for Package and Finished which will always be last
-	var signals = []string{"Package", "Finished", "Error", "Destroy"}
+	var signals = []string{"Package", "Finished", "ErrorCode", "Destroy"}
 	removeSignals, err := obj.matchSignal(ch, interfacePath, PkIfaceTransaction, signals)
 	if err != nil {
 		return nil, err
@@ -315,16 +400,22 @@ loop:
 	for {
 		// FIXME: add a timeout option to error in case signals are dropped!
 		select {
-		case signal := <-ch:
+		case signal, ok := <-ch:
+			if !ok {
+				// channel closed, e.g. the bus connection died
+				return []string{}, fmt.Errorf("signal channel closed unexpectedly")
+			}
 			if obj.Debug {
 				obj.Logf("ResolvePackages(): Signal: %+v", signal)
 			}
 			if signal.Path != interfacePath {
-				obj.Logf("Woops: Signal.Path: %+v", signal.Path)
+				obj.Logf("woops: Signal.Path: %+v", signal.Path)
 				continue loop
 			}
 
-			if signal.Name == FmtTransactionMethod("Package") {
+			if signal.Name == FmtTransactionMethod("ErrorCode") {
+				return []string{}, newPkError(signal.Body)
+			} else if signal.Name == FmtTransactionMethod("Package") {
 				//pkg_int, ok := signal.Body[0].(int)
 				packageID, ok := signal.Body[1].(string)
 				// format is: name;version;arch;data
@@ -347,16 +438,19 @@ loop:
 			} else {
 				return []string{}, fmt.Errorf("error in body: %v", signal.Body)
 			}
+
+		case <-ctx.Done(): // the engine cancelled us, e.g. a slow network
+			return []string{}, ctx.Err()
 		}
 	}
 	return packageIDs, nil
 }
 
 // IsInstalledList queries a list of packages to see if they are installed.
-func (obj *Conn) IsInstalledList(packages []string) ([]bool, error) {
+func (obj *Conn) IsInstalledList(ctx context.Context, packages []string) ([]bool, error) {
 	var filter uint64          // initializes at the "zero" value of 0
 	filter += PkFilterEnumArch // always search in our arch
-	packageIDs, err := obj.ResolvePackages(packages, filter)
+	packageIDs, err := obj.ResolvePackages(ctx, packages, filter)
 	if err != nil {
 		return nil, errwrap.Wrapf(err, "error resolving packages")
 	}
@@ -378,7 +472,7 @@ func (obj *Conn) IsInstalledList(packages []string) ([]bool, error) {
 		}
 	}
 
-	var r []bool
+	r := make([]bool, 0, len(packages))
 	for _, p := range packages {
 		if value, exists := m[p]; exists {
 			r = append(r, value > 0) // at least 1 means installed
@@ -391,16 +485,77 @@ func (obj *Conn) IsInstalledList(packages []string) ([]bool, error) {
 
 // IsInstalled returns if a package is installed.
 // TODO: this could be optimized by making the resolve call directly
-func (obj *Conn) IsInstalled(pkg string) (bool, error) {
-	p, e := obj.IsInstalledList([]string{pkg})
+func (obj *Conn) IsInstalled(ctx context.Context, pkg string) (bool, error) {
+	p, err := obj.IsInstalledList(ctx, []string{pkg})
+	if err != nil {
+		return false, err
+	}
 	if len(p) != 1 {
-		return false, e
+		return false, fmt.Errorf("unexpected result count %d for package %s", len(p), pkg)
 	}
 	return p[0], nil
 }
 
+// RefreshCache refreshes the package cache on its own transaction. PackageKit
+// transactions are single-shot, so callers that also want to install or remove
+// packages must do that on a separate transaction.
+func (obj *Conn) RefreshCache(force bool) error {
+	ch := make(chan *dbus.Signal, PkBufferSize)   // we need to buffer :(
+	interfacePath, err := obj.CreateTransaction() // emits Destroy on close
+	if err != nil {
+		return err
+	}
+
+	var signals = []string{"RepoDetail", "ErrorCode", "Finished", "Destroy"} // "Progress", "Status" ?
+	removeSignals, err := obj.matchSignal(ch, interfacePath, PkIfaceTransaction, signals)
+	if err != nil {
+		return err
+	}
+	defer removeSignals()
+
+	bus := obj.GetBus().Object(PkIface, interfacePath) // pass in found transaction path
+	call := bus.Call(FmtTransactionMethod("RefreshCache"), 0, force)
+	if call.Err != nil {
+		return call.Err
+	}
+loop:
+	for {
+		// FIXME: add a timeout option to error in case signals are dropped!
+		select {
+		case signal, ok := <-ch:
+			if !ok {
+				// channel closed, e.g. the bus connection died
+				return fmt.Errorf("signal channel closed unexpectedly")
+			}
+			if signal.Path != interfacePath {
+				obj.Logf("woops: Signal.Path: %+v", signal.Path)
+				continue loop
+			}
+
+			if signal.Name == FmtTransactionMethod("ErrorCode") {
+				return newPkError(signal.Body)
+			} else if signal.Name == FmtTransactionMethod("RepoDetail") {
+				continue loop
+			} else if signal.Name == FmtTransactionMethod("Finished") {
+				// TODO: should we wait for the Destroy signal?
+				break loop
+			} else if signal.Name == FmtTransactionMethod("Destroy") {
+				// should already be broken
+				break loop
+			} else {
+				return fmt.Errorf("error in body: %v", signal.Body)
+			}
+		}
+	}
+	return nil
+}
+
 // InstallPackages installs a list of packages by packageID.
 func (obj *Conn) InstallPackages(packageIDs []string, transactionFlags uint64) error {
+
+	if err := obj.RefreshCache(false); err != nil {
+		return errwrap.Wrapf(err, "can't refresh cache")
+	}
 
 	ch := make(chan *dbus.Signal, PkBufferSize)   // we need to buffer :(
 	interfacePath, err := obj.CreateTransaction() // emits Destroy on close
@@ -416,11 +571,7 @@ func (obj *Conn) InstallPackages(packageIDs []string, transactionFlags uint64) e
 	defer removeSignals()
 
 	bus := obj.GetBus().Object(PkIface, interfacePath) // pass in found transaction path
-	call := bus.Call(FmtTransactionMethod("RefreshCache"), 0, false)
-	if call.Err != nil {
-		return call.Err
-	}
-	call = bus.Call(FmtTransactionMethod("InstallPackages"), 0, transactionFlags, packageIDs)
+	call := bus.Call(FmtTransactionMethod("InstallPackages"), 0, transactionFlags, packageIDs)
 	if call.Err != nil {
 		return call.Err
 	}
@@ -429,14 +580,18 @@ func (obj *Conn) InstallPackages(packageIDs []string, transactionFlags uint64) e
 loop:
 	for {
 		select {
-		case signal := <-ch:
+		case signal, ok := <-ch:
+			if !ok {
+				// channel closed, e.g. the bus connection died
+				return fmt.Errorf("signal channel closed unexpectedly")
+			}
 			if signal.Path != interfacePath {
-				obj.Logf("Woops: Signal.Path: %+v", signal.Path)
+				obj.Logf("woops: Signal.Path: %+v", signal.Path)
 				continue loop
 			}
 
 			if signal.Name == FmtTransactionMethod("ErrorCode") {
-				return fmt.Errorf("error in body: %v", signal.Body)
+				return newPkError(signal.Body)
 			} else if signal.Name == FmtTransactionMethod("Package") {
 				// a package was installed...
 				// only start the timer once we're here...
@@ -486,16 +641,20 @@ loop:
 	for {
 		// FIXME: add a timeout option to error in case signals are dropped!
 		select {
-		case signal := <-ch:
+		case signal, ok := <-ch:
+			if !ok {
+				// channel closed, e.g. the bus connection died
+				return fmt.Errorf("signal channel closed unexpectedly")
+			}
 			if signal.Path != interfacePath {
-				obj.Logf("Woops: Signal.Path: %+v", signal.Path)
+				obj.Logf("woops: Signal.Path: %+v", signal.Path)
 				continue loop
 			}
 
 			if signal.Name == FmtTransactionMethod("ErrorCode") {
-				return fmt.Errorf("error in body: %v", signal.Body)
+				return newPkError(signal.Body)
 			} else if signal.Name == FmtTransactionMethod("Package") {
-				// a package was installed...
+				// a package was uninstalled...
 				continue loop
 			} else if signal.Name == FmtTransactionMethod("Finished") {
 				// TODO: should we wait for the Destroy signal?
@@ -535,14 +694,18 @@ loop:
 	for {
 		// FIXME: add a timeout option to error in case signals are dropped!
 		select {
-		case signal := <-ch:
+		case signal, ok := <-ch:
+			if !ok {
+				// channel closed, e.g. the bus connection died
+				return fmt.Errorf("signal channel closed unexpectedly")
+			}
 			if signal.Path != interfacePath {
-				obj.Logf("Woops: Signal.Path: %+v", signal.Path)
+				obj.Logf("woops: Signal.Path: %+v", signal.Path)
 				continue loop
 			}
 
 			if signal.Name == FmtTransactionMethod("ErrorCode") {
-				return fmt.Errorf("error in body: %v", signal.Body)
+				return newPkError(signal.Body)
 			} else if signal.Name == FmtTransactionMethod("Package") {
 			} else if signal.Name == FmtTransactionMethod("Finished") {
 				// TODO: should we wait for the Destroy signal?
@@ -560,7 +723,7 @@ loop:
 
 // GetFilesByPackageID gets the list of files that are contained inside a list
 // of packageIDs.
-func (obj *Conn) GetFilesByPackageID(packageIDs []string) (files map[string][]string, err error) {
+func (obj *Conn) GetFilesByPackageID(ctx context.Context, packageIDs []string) (files map[string][]string, err error) {
 	// NOTE: the maximum number of files in an RPM is 52116 in Fedora 23
 	// https://gist.github.com/purpleidea/b98e60dcd449e1ac3b8a
 	ch := make(chan *dbus.Signal, PkBufferSize) // we need to buffer :(
@@ -587,15 +750,20 @@ loop:
 	for {
 		// FIXME: add a timeout option to error in case signals are dropped!
 		select {
-		case signal := <-ch:
+		case signal, ok := <-ch:
+			if !ok {
+				// channel closed, e.g. the bus connection died
+				err = fmt.Errorf("signal channel closed unexpectedly")
+				return
+			}
 
 			if signal.Path != interfacePath {
-				obj.Logf("Woops: Signal.Path: %+v", signal.Path)
+				obj.Logf("woops: Signal.Path: %+v", signal.Path)
 				continue loop
 			}
 
 			if signal.Name == FmtTransactionMethod("ErrorCode") {
-				err = fmt.Errorf("error in body: %v", signal.Body)
+				err = newPkError(signal.Body)
 				return
 
 				// one signal returned per packageID found...
@@ -623,6 +791,10 @@ loop:
 				err = fmt.Errorf("error in body: %v", signal.Body)
 				return
 			}
+
+		case <-ctx.Done(): // the engine cancelled us, e.g. a slow network
+			err = ctx.Err()
+			return
 		}
 	}
 	return
@@ -657,14 +829,18 @@ loop:
 	for {
 		// FIXME: add a timeout option to error in case signals are dropped!
 		select {
-		case signal := <-ch:
+		case signal, ok := <-ch:
+			if !ok {
+				// channel closed, e.g. the bus connection died
+				return nil, fmt.Errorf("signal channel closed unexpectedly")
+			}
 			if signal.Path != interfacePath {
-				obj.Logf("Woops: Signal.Path: %+v", signal.Path)
+				obj.Logf("woops: Signal.Path: %+v", signal.Path)
 				continue loop
 			}
 
 			if signal.Name == FmtTransactionMethod("ErrorCode") {
-				return nil, fmt.Errorf("error in body: %v", signal.Body)
+				return nil, newPkError(signal.Body)
 			} else if signal.Name == FmtTransactionMethod("Package") {
 
 				//pkg_int, ok := signal.Body[0].(int)
@@ -698,7 +874,7 @@ loop:
 // outside mgmt. The packageMap input has the package names as keys and
 // requested states as values. These states can be: installed, uninstalled,
 // newest or a requested version str.
-func (obj *Conn) PackagesToPackageIDs(packageMap map[string]string, filter uint64) (map[string]*PkPackageIDActionData, error) {
+func (obj *Conn) PackagesToPackageIDs(ctx context.Context, packageMap map[string]string, filter uint64) (map[string]*PkPackageIDActionData, error) {
 	count := 0
 	packages := make([]string, len(packageMap))
 	for k := range packageMap { // lol, golang has no hash.keys() function!
@@ -713,7 +889,7 @@ func (obj *Conn) PackagesToPackageIDs(packageMap map[string]string, filter uint6
 	if obj.Debug {
 		obj.Logf("PackagesToPackageIDs(): %s", strings.Join(packages, ", "))
 	}
-	resolved, err := obj.ResolvePackages(packages, filter)
+	resolved, err := obj.ResolvePackages(ctx, packages, filter)
 	if err != nil {
 		return nil, errwrap.Wrapf(err, "error resolving")
 	}
@@ -839,7 +1015,7 @@ func (obj *Conn) PackagesToPackageIDs(packageMap map[string]string, filter uint6
 			if obj.Debug {
 				obj.Logf("PackagesToPackageIDs(): Recurse: %s", strings.Join(checkPackages, ", "))
 			}
-			recursion, err = obj.PackagesToPackageIDs(filteredPackageMap, filter+PkFilterEnumNewest)
+			recursion, err = obj.PackagesToPackageIDs(ctx, filteredPackageMap, filter+PkFilterEnumNewest)
 			if err != nil {
 				return nil, errwrap.Wrapf(err, "recursion error")
 			}
@@ -904,8 +1080,10 @@ func FilterState(m map[string]*PkPackageIDActionData, packages []string, state s
 			b = !p.Installed
 		} else if state == "newest" {
 			b = p.Newest
+		} else if state != "" {
+			// treat any non-empty unknown state as a version pin
+			b = state == p.Version
 		} else {
-			// we can't filter "version" state in this function
 			pkgs = append(pkgs, k)
 			continue
 		}

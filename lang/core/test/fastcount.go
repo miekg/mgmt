@@ -39,25 +39,25 @@ import (
 )
 
 const (
-	// FastCountFuncName is the name this fact is registered as. It's still
-	// a Func Name because this is the name space the fact is actually
-	// using.
+	// FastCountFuncName is the name this func is registered as.
 	FastCountFuncName = "fastcount"
 )
 
 func init() {
-	funcs.ModuleRegister(ModuleName, FastCountFuncName, func() interfaces.Func { return &FastCount{} }) // must register the fact and name
+	funcs.ModuleRegister(ModuleName, FastCountFuncName, func() interfaces.Func { return &FastCount{} })
 }
 
-// FastCount is a fact that counts up as fast as possible from zero forever.
+// FastCount is a func that counts up as fast as possible from zero forever.
 type FastCount struct {
+	interfaces.Textarea
+
 	init *interfaces.Init
 
 	mutex *sync.Mutex
 	count int
 }
 
-// String returns a simple name for this fact. This is needed so this struct can
+// String returns a simple name for this func. This is needed so this struct can
 // satisfy the pgraph.Vertex interface.
 func (obj *FastCount) String() string {
 	return FastCountFuncName
@@ -71,7 +71,7 @@ func (obj *FastCount) Validate() error {
 // Info returns some static info about itself.
 func (obj *FastCount) Info() *interfaces.Info {
 	return &interfaces.Info{
-		Pure: false, // non-constant facts can't be pure!
+		Pure: false, // non-constant funcs can't be pure!
 		Memo: false,
 		Fast: false,
 		Spec: false,
@@ -79,7 +79,7 @@ func (obj *FastCount) Info() *interfaces.Info {
 	}
 }
 
-// Init runs some startup code for this fact.
+// Init runs some startup code for this func.
 func (obj *FastCount) Init(init *interfaces.Init) error {
 	obj.init = init
 	obj.mutex = &sync.Mutex{}
@@ -107,7 +107,7 @@ func (obj *FastCount) Stream(ctx context.Context) error {
 	}
 }
 
-// Call this fact and return the value if it is possible to do so at this time.
+// Call this func and return the value if it is possible to do so at this time.
 func (obj *FastCount) Call(ctx context.Context, args []types.Value) (types.Value, error) {
 	if obj.mutex == nil {
 		return nil, funcs.ErrCantSpeculate

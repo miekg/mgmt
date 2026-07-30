@@ -51,7 +51,12 @@ type GroupableRes interface {
 	SetAutoGroupMeta(*AutoGroupMeta)
 
 	// GroupCmp compares two resources and decides if they're suitable for
-	// grouping. This usually needs to be unique to your resource.
+	// grouping. This usually needs to be unique to your resource. The two
+	// resources must share the first colon-separated chunk of their kind
+	// (eg: "http:server" and "http:server:ui" both start with "http") or
+	// they will never even be offered to this method, since the grouping
+	// algorithm uses that fact to prune the candidate pairs. Grouping
+	// across entirely unrelated kinds was never a sensible thing to do.
 	GroupCmp(res GroupableRes) error
 
 	// GroupRes groups resource argument (res) into self. Callers of this
@@ -102,6 +107,7 @@ type AutoGrouper interface {
 	Init(*pgraph.Graph) error                                        // only call once
 	VertexNext() (pgraph.Vertex, pgraph.Vertex, error)               // mostly algorithmic
 	VertexCmp(pgraph.Vertex, pgraph.Vertex) error                    // can we merge these ?
+	VertexViable(pgraph.Vertex, pgraph.Vertex) error                 // does the graph allow it ?
 	VertexMerge(pgraph.Vertex, pgraph.Vertex) (pgraph.Vertex, error) // vertex merge fn to use
 	EdgeMerge(pgraph.Edge, pgraph.Edge) pgraph.Edge                  // edge merge fn to use
 	VertexTest(bool) (bool, error)                                   // call until false

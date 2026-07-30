@@ -195,7 +195,7 @@ func (obj *SysctlRes) Watch(ctx context.Context) error {
 
 	recurse := false // single file
 
-	var events1, events2 chan recwatch.Event
+	var events1, events2 chan *recwatch.Event
 
 	if obj.Runtime {
 		recWatcher, err := recwatch.NewRecWatcher(obj.toPath(), recurse)
@@ -215,13 +215,19 @@ func (obj *SysctlRes) Watch(ctx context.Context) error {
 		events2 = recWatcher.Events()
 	}
 
-	obj.init.Running() // when started, notify engine that we're running
+	if err := obj.init.Event(ctx); err != nil {
+		return err
+	}
 
 	for {
 		select {
 		case event, ok := <-events1:
 			if !ok { // channel shutdown
 				return fmt.Errorf("unexpected close")
+			}
+			if event == nil {
+				// programming error
+				return fmt.Errorf("unexpected nil recwatch event")
 			}
 			if err := event.Error; err != nil {
 				return err
@@ -234,6 +240,10 @@ func (obj *SysctlRes) Watch(ctx context.Context) error {
 			if !ok { // channel shutdown
 				return fmt.Errorf("unexpected close")
 			}
+			if event == nil {
+				// programming error
+				return fmt.Errorf("unexpected nil recwatch event")
+			}
 			if err := event.Error; err != nil {
 				return err
 			}
@@ -242,10 +252,12 @@ func (obj *SysctlRes) Watch(ctx context.Context) error {
 			}
 
 		case <-ctx.Done(): // closed by the engine to signal shutdown
-			return nil
+			return ctx.Err()
 		}
 
-		obj.init.Event() // notify engine of an event (this can block)
+		if err := obj.init.Event(ctx); err != nil {
+			return err
+		}
 	}
 }
 
@@ -299,7 +311,7 @@ func (obj *SysctlRes) runtimeCheckApply(ctx context.Context, apply bool) (bool, 
 		return false, nil
 	}
 
-	if err := os.WriteFile(obj.toPath(), expected, 0644); err != nil {
+	if err := os.WriteFile(obj.toPath(), expected, 0600); err != nil {
 		return false, err
 	}
 
@@ -335,6 +347,7 @@ func (obj *SysctlRes) persistCheckApply(ctx context.Context, apply bool) (bool, 
 		return false, nil
 	}
 
+	//nolint:gosec // G306: /etc/sysctl.d config files are world-readable by convention
 	if err := os.WriteFile(obj.getFilename(), expected, 0644); err != nil {
 		return false, err
 	}

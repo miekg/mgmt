@@ -57,6 +57,8 @@ func init() {
 // FileExistsFunc is a function that returns if a local file exists or not. This
 // works with directories too.
 type FileExistsFunc struct {
+	interfaces.Textarea
+
 	init *interfaces.Init
 
 	recWatcher *recwatch.RecWatcher
@@ -114,7 +116,7 @@ func (obj *FileExistsFunc) Stream(ctx context.Context) error {
 	defer wg.Wait()
 	defer func() {
 		if obj.recWatcher != nil {
-			obj.recWatcher.Close() // close previous watcher
+			_ = obj.recWatcher.Close() // close previous watcher
 			wg.Wait()
 		}
 	}()
@@ -140,7 +142,7 @@ func (obj *FileExistsFunc) Stream(ctx context.Context) error {
 			obj.filename = &filename
 
 			if obj.recWatcher != nil {
-				obj.recWatcher.Close() // close previous watcher
+				_ = obj.recWatcher.Close() // close previous watcher
 				wg.Wait()
 			}
 			// create new watcher
@@ -179,6 +181,11 @@ func (obj *FileExistsFunc) Stream(ctx context.Context) error {
 					case event, ok := <-obj.recWatcher.Events():
 						if !ok {
 							return // file watcher shut down
+						}
+						if event == nil {
+							// programming error
+							err = fmt.Errorf("unexpected nil recwatch event")
+							break
 						}
 						if err = event.Error; err != nil {
 							err = errwrap.Wrapf(err, "error event received")

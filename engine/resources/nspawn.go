@@ -75,8 +75,8 @@ type NspawnRes struct {
 	State string `lang:"state" yaml:"state"`
 
 	// We're using the svc resource to start and stop the machine because
-	// that's what machinectl does. We're not using svc.Watch because then we
-	// would have two watches potentially racing each other and producing
+	// that's what machinectl does. We're not using svc.Watch because then
+	// we would have two watches potentially racing each other and producing
 	// potentially unexpected results. We get everything we need to monitor
 	// the machine state changes from the org.freedesktop.machine1 object.
 	svc *SvcRes
@@ -181,7 +181,9 @@ func (obj *NspawnRes) Watch(ctx context.Context) error {
 	bus.Signal(busChan)
 	defer bus.RemoveSignal(busChan) // not needed here, but nice for symmetry
 
-	obj.init.Running() // when started, notify engine that we're running
+	if err := obj.init.Event(ctx); err != nil {
+		return err
+	}
 
 	for {
 		select {
@@ -190,20 +192,22 @@ func (obj *NspawnRes) Watch(ctx context.Context) error {
 			if event.Body[0] != obj.Name() {
 				continue
 			}
-			obj.init.Logf("Event received: %v", event.Name)
+			obj.init.Logf("event received: %v", event.Name)
 			if event.Name == machineNew {
-				obj.init.Logf("Machine started")
+				obj.init.Logf("machine started")
 			} else if event.Name == machineRemoved {
-				obj.init.Logf("Machine stopped")
+				obj.init.Logf("machine stopped")
 			} else {
 				return fmt.Errorf("unknown event: %s", event.Name)
 			}
 
 		case <-ctx.Done(): // closed by the engine to signal shutdown
-			return nil
+			return ctx.Err()
 		}
 
-		obj.init.Event() // notify engine of an event (this can block)
+		if err := obj.init.Event(ctx); err != nil {
+			return err
+		}
 	}
 }
 

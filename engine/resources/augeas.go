@@ -64,8 +64,8 @@ type AugeasRes struct {
 	// File is the path to the file targeted by this resource.
 	File string `lang:"file" yaml:"file"`
 
-	// Lens is the lens used by this resource. If specified, mgmt
-	// will lower the augeas overhead by only loading that lens.
+	// Lens is the lens used by this resource. If specified, mgmt will lower
+	// the augeas overhead by only loading that lens.
 	Lens string `lang:"lens" yaml:"lens"`
 
 	// Sets is a list of changes that will be applied to the file, in the
@@ -143,11 +143,13 @@ func (obj *AugeasRes) Watch(ctx context.Context) error {
 	}
 	defer recWatcher.Close()
 
-	obj.init.Running() // when started, notify engine that we're running
+	if err := obj.init.Event(ctx); err != nil {
+		return err
+	}
 
 	for {
 		if obj.init.Debug {
-			obj.init.Logf("Watching: %s", obj.File) // attempting to watch...
+			obj.init.Logf("watching: %s", obj.File) // attempting to watch...
 		}
 
 		select {
@@ -155,18 +157,24 @@ func (obj *AugeasRes) Watch(ctx context.Context) error {
 			if !ok { // channel shutdown
 				return nil
 			}
+			if event == nil {
+				// programming error
+				return fmt.Errorf("unexpected nil recwatch event")
+			}
 			if err := event.Error; err != nil {
-				return errwrap.Wrapf(err, "Unknown %s watcher error", obj)
+				return errwrap.Wrapf(err, "unknown %s watcher error", obj)
 			}
 			if obj.init.Debug { // don't access event.Body if event.Error isn't nil
-				obj.init.Logf("Event(%s): %v", event.Body.Name, event.Body.Op)
+				obj.init.Logf("event(%s): %v", event.Body.Name, event.Body.Op)
 			}
 
 		case <-ctx.Done(): // closed by the engine to signal shutdown
-			return nil
+			return ctx.Err()
 		}
 
-		obj.init.Event() // notify engine of an event (this can block)
+		if err := obj.init.Event(ctx); err != nil {
+			return err
+		}
 	}
 }
 

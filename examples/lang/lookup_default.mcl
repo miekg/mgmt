@@ -1,6 +1,6 @@
 import "fmt"
 
-$some_list = ["l", "m", "n",]
+$some_list = ["l", "m", "n"]
 
 $some_map = {
 	"ottawa" => 6,
@@ -16,7 +16,7 @@ print "letter" {
 }
 
 print "city" {
-	msg => fmt.printf("city: %d", $some_map["montréal"] || 13),
+	msg => fmt.printf("city: %d", $some_map["montreal"] || 13),
 
 	Meta:autogroup => false,
 }

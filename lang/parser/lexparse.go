@@ -72,8 +72,8 @@ type LexParseErr struct {
 }
 
 // Error displays this error with all the relevant state information.
-func (e *LexParseErr) Error() string {
-	return fmt.Sprintf("%s: `%s` @%d:%d", e.Err, e.Str, e.Row+1, e.Col+1)
+func (obj *LexParseErr) Error() string {
+	return fmt.Sprintf("%s: `%s` @%d:%d", obj.Err, obj.Str, obj.Row+1, obj.Col+1)
 }
 
 // lexParseAST is a struct which we pass into the lexer/parser so that we have a
@@ -88,7 +88,8 @@ type lexParseAST struct {
 	parseErr error // from Error(e string)
 }
 
-// LexParse runs the lexer/parser machinery and returns the AST.
+// LexParse runs the lexer/parser machinery and returns the AST. Make sure that
+// the final character is a newline, or the parser may error.
 func LexParse(input io.Reader) (interfaces.Stmt, error) {
 	lp := &lexParseAST{}
 	// parseResult is a seemingly unused field in the Lexer struct for us...
@@ -144,6 +145,7 @@ func LexParseWithOffsets(input io.Reader, offsets map[uint64]string) (interfaces
 
 	// TODO: switch this to an offset in bytes instead of lines
 	// TODO: we'll also need a way to convert that into the new row number!
+	//nolint:gosec // G115: a parser row number is non-negative
 	row := uint64(e.Row)
 	var i uint64           // initial condition
 	filename := offsets[0] // (assumption)

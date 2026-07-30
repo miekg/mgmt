@@ -135,7 +135,7 @@ type VirtBuilderRes struct {
 	SSHKeys []*SSHKeyInfo `lang:"ssh_keys" yaml:"ssh_keys"`
 
 	// RootSSHInject disables installing the root ssh key into the new vm.
-	// If one is not present, then nothing is done.	This defaults to true.
+	// If one is not present, then nothing is done. This defaults to true.
 	RootSSHInject bool `lang:"root_ssh_inject" yaml:"root_ssh_inject"`
 
 	// RootPasswordSelector is a string in the virt-builder format. See the
@@ -437,13 +437,19 @@ func (obj *VirtBuilderRes) Watch(ctx context.Context) error {
 	}
 	defer recWatcher.Close()
 
-	obj.init.Running() // when started, notify engine that we're running
+	if err := obj.init.Event(ctx); err != nil {
+		return err
+	}
 
 	for {
 		select {
 		case event, ok := <-recWatcher.Events():
 			if !ok { // channel shutdown
 				return fmt.Errorf("unexpected close")
+			}
+			if event == nil {
+				// programming error
+				return fmt.Errorf("unexpected nil recwatch event")
 			}
 			if err := event.Error; err != nil {
 				return err
@@ -453,10 +459,12 @@ func (obj *VirtBuilderRes) Watch(ctx context.Context) error {
 			}
 
 		case <-ctx.Done(): // closed by the engine to signal shutdown
-			return nil
+			return ctx.Err()
 		}
 
-		obj.init.Event() // notify engine of an event (this can block)
+		if err := obj.init.Event(ctx); err != nil {
+			return err
+		}
 	}
 }
 

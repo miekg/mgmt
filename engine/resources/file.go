@@ -55,6 +55,8 @@ import (
 	"github.com/purpleidea/mgmt/util"
 	"github.com/purpleidea/mgmt/util/errwrap"
 	"github.com/purpleidea/mgmt/util/recwatch"
+
+	"golang.org/x/sys/unix"
 )
 
 func init() {
@@ -83,6 +85,8 @@ func init() {
 		},
 	})
 }
+
+var _ engine.EdgeableRes = &FileRes{} // compile time check
 
 const (
 	// KindFile is the kind string used to identify this resource.
@@ -132,10 +136,10 @@ type FileRes struct {
 
 	// State specifies the desired state of the file. It can be either
 	// `exists` or `absent`. If you do not specify this, we will not be able
-	// to create or remove a file if it might be logical for another
-	// param to require that. Instead it will error. This means that this
-	// field is not implied by specifying some content or a mode. This is
-	// also used when determining how we manage a symlink.
+	// to create or remove a file if it might be logical for another param
+	// to require that. Instead it will error. This means that this field is
+	// not implied by specifying some content or a mode. This is also used
+	// when determining how we manage a symlink.
 	State string `lang:"state" yaml:"state"`
 
 	// Content specifies the file contents to use. If this is nil, they are
@@ -212,6 +216,9 @@ type FileRes struct {
 	// relative path.
 	Symlink bool `lang:"symlink" yaml:"symlink"`
 
+	// SELinux specifies the SELinux security context for the file.
+	SELinux *string `lang:"selinux" yaml:"selinux"`
+
 	sha256sum string
 }
 
@@ -249,7 +256,7 @@ func (obj *FileRes) isDir() bool {
 // not empty.
 func (obj *FileRes) mode() (os.FileMode, error) {
 	// First check if this is an octal number.
-	if n, err := strconv.ParseInt(obj.Mode, 8, 32); err == nil {
+	if n, err := strconv.ParseUint(obj.Mode, 8, 32); err == nil {
 		return os.FileMode(n), nil
 	}
 
@@ -265,7 +272,7 @@ func (obj *FileRes) mode() (os.FileMode, error) {
 		return os.FileMode(0), errwrap.Wrapf(err, "mode should be an octal number or symbolic mode (%s)", obj.Mode)
 	}
 
-	return os.FileMode(m), nil
+	return m, nil
 }
 
 // Default returns some sensible defaults for this resource.
@@ -310,6 +317,10 @@ func (obj *FileRes) Validate() error {
 
 	if obj.State == FileStateAbsent && (isContent || isSrc || isFrag) {
 		return fmt.Errorf("can't specify file Content, Source, or Fragments when State is %s", FileStateAbsent)
+	}
+
+	if obj.State == FileStateAbsent && obj.SELinux != nil {
+		return fmt.Errorf("can't specify SELinux when State is %s", FileStateAbsent)
 	}
 
 	// The path and Source must either both be dirs or both not be.
@@ -415,8 +426,7 @@ func (obj *FileRes) Cleanup() error {
 // error, it means that something has gone wrong, and it must be restarted. On a
 // clean exit it returns nil.
 func (obj *FileRes) Watch(ctx context.Context) error {
-	// TODO: chan *recwatch.Event instead?
-	inputEvents := make(chan recwatch.Event)
+	inputEvents := make(chan *recwatch.Event)
 	defer close(inputEvents)
 
 	wg := &sync.WaitGroup{}
@@ -447,8 +457,7 @@ func (obj *FileRes) Watch(ctx context.Context) error {
 		go func() {
 			defer wg.Done()
 			for {
-				// TODO: *recwatch.Event instead?
-				var event recwatch.Event
+				var event *recwatch.Event
 				var ok bool
 				var shutdown bool
 				select {
@@ -459,7 +468,7 @@ func (obj *FileRes) Watch(ctx context.Context) error {
 
 				if !ok {
 					err := fmt.Errorf("channel shutdown")
-					event = recwatch.Event{Error: err}
+					event = &recwatch.Event{Error: err}
 					shutdown = true
 				}
 
@@ -488,8 +497,7 @@ func (obj *FileRes) Watch(ctx context.Context) error {
 		go func() {
 			defer wg.Done()
 			for {
-				// TODO: *recwatch.Event instead?
-				var event recwatch.Event
+				var event *recwatch.Event
 				var ok bool
 				var shutdown bool
 				select {
@@ -500,7 +508,7 @@ func (obj *FileRes) Watch(ctx context.Context) error {
 
 				if !ok {
 					err := fmt.Errorf("channel shutdown")
-					event = recwatch.Event{Error: err}
+					event = &recwatch.Event{Error: err}
 					shutdown = true
 				}
 
@@ -516,7 +524,9 @@ func (obj *FileRes) Watch(ctx context.Context) error {
 		}()
 	}
 
-	obj.init.Running() // when started, notify engine that we're running
+	if err := obj.init.Event(ctx); err != nil {
+		return err
+	}
 
 	for {
 		if obj.init.Debug {
@@ -531,6 +541,10 @@ func (obj *FileRes) Watch(ctx context.Context) error {
 				//return nil
 				return fmt.Errorf("unexpected close")
 			}
+			if event == nil {
+				// programming error
+				return fmt.Errorf("unexpected nil recwatch event")
+			}
 			if err := event.Error; err != nil {
 				return errwrap.Wrapf(err, "unknown %s watcher error", obj)
 			}
@@ -542,6 +556,10 @@ func (obj *FileRes) Watch(ctx context.Context) error {
 			if !ok {
 				return fmt.Errorf("unexpected close")
 			}
+			if event == nil {
+				// programming error
+				return fmt.Errorf("unexpected nil recwatch event")
+			}
 			if err := event.Error; err != nil {
 				return errwrap.Wrapf(err, "unknown %s input watcher error", obj)
 			}
@@ -550,10 +568,12 @@ func (obj *FileRes) Watch(ctx context.Context) error {
 			}
 
 		case <-ctx.Done(): // closed by the engine to signal shutdown
-			return nil
+			return ctx.Err()
 		}
 
-		obj.init.Event() // notify engine of an event (this can block)
+		if err := obj.init.Event(ctx); err != nil {
+			return err
+		}
 	}
 }
 
@@ -681,7 +701,7 @@ func (obj *FileRes) fileCheckApply(ctx context.Context, apply bool, src io.ReadS
 		obj.init.Logf("apply: %v -> %s", src, dst)
 	}
 
-	dstClose() // unlock file usage so we can write to it
+	_ = dstClose() // unlock file usage so we can write to it (may return os.ErrInvalid)
 	dstFile, err = os.Create(dst)
 	if err != nil {
 		return sha256sum, false, err
@@ -806,7 +826,7 @@ func (obj *FileRes) syncCheckApply(ctx context.Context, apply bool, src, dst str
 
 		_, checkOK, err := obj.fileCheckApply(ctx, apply, fin, dst, "")
 		if err != nil {
-			fin.Close()
+			_ = fin.Close()
 			return false, err
 		}
 		return checkOK, fin.Close()
@@ -1020,6 +1040,7 @@ func (obj *FileRes) stateCheckApply(ctx context.Context, apply bool) (bool, erro
 	// one is magically created right after our exists test. The chmod used
 	// is what is used by the os.Create function.
 	// TODO: is using O_EXCL okay?
+	//nolint:gosec // G302: mimics os.Create (0666); the Mode param sets the real mode
 	f, err := os.OpenFile(obj.getPath(), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0666)
 	if err != nil {
 		return false, errwrap.Wrapf(err, "problem creating empty file")
@@ -1357,6 +1378,62 @@ func (obj *FileRes) symlinkCheckApply(ctx context.Context, apply bool) (bool, er
 	return false, os.Symlink(obj.Source, p)
 }
 
+// selinuxCheckApply checks the file SELinux security context.
+func (obj *FileRes) selinuxCheckApply(ctx context.Context, apply bool) (bool, error) {
+	if obj.init.Debug {
+		obj.init.Logf("selinuxCheckApply(%t)", apply)
+	}
+
+	if obj.SELinux == nil { // nothing specified, we're done
+		return true, nil
+	}
+
+	// TODO: use https://github.com/opencontainers/selinux instead?
+	// use Lgetxattr for symlinks...
+	buf := make([]byte, 4096) // should be plenty for context
+	size, err := unix.Lgetxattr(obj.getPath(), "security.selinux", buf)
+	if err != nil && err != unix.ENODATA && err != unix.EOPNOTSUPP && err != unix.ENOTSUP {
+		return false, err
+	}
+
+	currentContext := ""
+	hasContext := false
+	if err == nil {
+		// SELinux contexts can be null terminated on disk
+		currentContext = string(bytes.Trim(buf[:size], "\x00"))
+		hasContext = true
+	}
+
+	if hasContext && *obj.SELinux == currentContext {
+		return true, nil
+	}
+	if !hasContext && *obj.SELinux == "" {
+		return true, nil
+	}
+
+	if !apply {
+		return false, nil
+	}
+
+	if *obj.SELinux == "" {
+		obj.init.Logf("removing selinux context")
+		err = unix.Lremovexattr(obj.getPath(), "security.selinux")
+	} else {
+		obj.init.Logf("selinux chcon: %s", *obj.SELinux)
+		// use Lsetxattr for symlinks...
+		err = unix.Lsetxattr(obj.getPath(), "security.selinux", []byte(*obj.SELinux), 0)
+	}
+
+	if err == unix.EOPNOTSUPP || err == unix.ENOTSUP {
+		return false, fmt.Errorf("setting SELinux context not supported on this filesystem")
+	}
+	if err != nil {
+		return false, err
+	}
+
+	return false, nil
+}
+
 // CheckApply checks the resource state and applies the resource if the bool
 // input is true. It returns error info and if the state check passed or not.
 func (obj *FileRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
@@ -1405,6 +1482,11 @@ func (obj *FileRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 		checkOK = false
 	}
 	if c, err := obj.chmodCheckApply(ctx, apply); err != nil {
+		return false, err
+	} else if !c {
+		checkOK = false
+	}
+	if c, err := obj.selinuxCheckApply(ctx, apply); err != nil {
 		return false, err
 	} else if !c {
 		checkOK = false
@@ -1476,6 +1558,15 @@ func (obj *FileRes) Cmp(r engine.Res) error {
 		return fmt.Errorf("the Symlink option differs")
 	}
 
+	if (obj.SELinux == nil) != (res.SELinux == nil) { // xor
+		return fmt.Errorf("the SELinux option differs")
+	}
+	if obj.SELinux != nil && res.SELinux != nil {
+		if *obj.SELinux != *res.SELinux {
+			return fmt.Errorf("the contents of SELinux differ")
+		}
+	}
+
 	return nil
 }
 
@@ -1492,6 +1583,15 @@ func (obj *FileUID) IFF(uid engine.ResUID) bool {
 		return false
 	}
 	return obj.path == res.path
+}
+
+// UIDHash returns the matching identity of this UID. Since IFF is a pure path
+// equality comparison, this satisfies the engine.ResUIDHashable contract, and
+// lets the autoedge matching find file candidates with a map lookup. This is
+// the UID type which shows up in large numbers, since every file resource also
+// asks about each of its parent directories when seeking automatic edges.
+func (obj *FileUID) UIDHash() string {
+	return obj.path
 }
 
 // FileResAutoEdges holds the state of the auto edge generator.
@@ -1554,7 +1654,7 @@ func (obj *FileResAutoEdges) Test(input []bool) bool {
 
 // AutoEdges generates a simple linear sequence of each parent directory from
 // the bottom up!
-func (obj *FileRes) AutoEdges() (engine.AutoEdge, error) {
+func (obj *FileRes) AutoEdges(ctx context.Context) (engine.AutoEdge, error) {
 	var data []engine.ResUID // store linear result chain here...
 	// don't use any memoization run in Init (this gets called before Init)
 	values := util.PathSplitFullReversed(obj.getPath())
@@ -1647,7 +1747,7 @@ func (obj *FileRes) Copy() engine.CopyableRes {
 	for _, frag := range obj.Fragments {
 		fragments = append(fragments, frag)
 	}
-	return &FileRes{
+	res := &FileRes{
 		Path:      obj.Path,
 		Dirname:   obj.Dirname,
 		Basename:  obj.Basename,
@@ -1661,7 +1761,14 @@ func (obj *FileRes) Copy() engine.CopyableRes {
 		Recurse:   obj.Recurse,
 		Force:     obj.Force,
 		Purge:     obj.Purge,
+		Symlink:   obj.Symlink,
+		SELinux:   obj.SELinux,
 	}
+	if obj.SELinux != nil {
+		s := *obj.SELinux
+		res.SELinux = &s
+	}
+	return res
 }
 
 // Reversed returns the "reverse" or "reciprocal" resource. This is used to
@@ -1748,6 +1855,7 @@ func (obj *FileRes) Reversed() (engine.ReversibleRes, error) {
 	res.Owner = ""
 	res.Group = ""
 	res.Mode = ""
+	res.SELinux = nil
 	if err == nil {
 		stUnix, ok := fileInfo.Sys().(*syscall.Stat_t)
 		// XXX: add a !ok error scenario or some alternative?
@@ -1763,6 +1871,20 @@ func (obj *FileRes) Reversed() (engine.ReversibleRes, error) {
 		// TODO: use Mode().String() when we support full rwx style mode specs!
 		if obj.Mode != "" {
 			res.Mode = fmt.Sprintf("%#o", fileInfo.Mode().Perm()) // 0400, 0777, etc.
+		}
+
+		if obj.SELinux != nil { // XXX: test this scenario
+			// use Lgetxattr for symlinks...
+			buf := make([]byte, 4096) // should be plenty for context
+			size, err := unix.Lgetxattr(obj.getPath(), "security.selinux", buf)
+			if err != nil && err != unix.ENODATA && err != unix.EOPNOTSUPP && err != unix.ENOTSUP {
+				return nil, errwrap.Wrapf(err, "could not get selinux context for reversal")
+			}
+			res.SELinux = new(string) // default to empty string if missing
+			if err == nil {
+				// SELinux contexts can be null terminated on disk
+				*res.SELinux = string(bytes.Trim(buf[:size], "\x00"))
+			}
 		}
 	}
 
@@ -1879,7 +2001,7 @@ func printFiles(fileInfos map[string]FileInfo) string {
 // file. The comparison against os.ErrInvalid and errors.Is checks don't work.
 func isInvalidSymlink(err error) bool {
 	if perr, ok := err.(*os.PathError); ok {
-		return perr.Err == syscall.EINVAL
+		return perr.Err == unix.EINVAL
 	}
 	return false
 }

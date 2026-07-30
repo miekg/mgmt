@@ -1,0 +1,6 @@
+-- main.mcl --
+$map1 map{int: str} = {42 => "hello1"}
+$name1 = $map1[13]
+test "${name1}" {}
+-- OUTPUT --
+# err: errStream: map key not present, want: 13 in {42: "hello1"}: /main.mcl @ 2:10-2:19

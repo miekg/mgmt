@@ -61,6 +61,11 @@ var (
 	// errorType represents a reflection type of error as seen in:
 	// https://github.com/golang/go/blob/ec62ee7f6d3839fe69aeae538dadc1c9dc3bf020/src/text/template/exec.go#L612
 	errorType = reflect.TypeOf((*error)(nil)).Elem()
+
+	// interfaceType represents a reflection type of interface{} which we
+	// use when the underlying mgmt type isn't reflectable. (See the
+	// reflectable function for more information.)
+	interfaceType = reflect.TypeOf((*interface{})(nil)).Elem()
 )
 
 func init() {
@@ -73,10 +78,13 @@ var _ interfaces.InferableFunc = &TemplateFunc{} // ensure it meets this expecta
 // returns the output as a string. It bases its output on the values passed in
 // to it. It examines the type of the second argument (the input data vars) at
 // compile time and then determines the static functions signature by including
-// that in the overall signature.
+// that in the overall signature. Every struct field in a template is accessed
+// by its Title-cased representation.
 // TODO: We *might* need to add events for internal function changes over time,
 // but only if they are not pure. We currently only use simple, pure functions.
 type TemplateFunc struct {
+	interfaces.Textarea
+
 	// Type is the type of the input vars (2nd) arg if one is specified. Nil
 	// is the special undetermined value that is used before type is known.
 	Type *types.Type // type of vars
@@ -256,7 +264,7 @@ func (obj *TemplateFunc) run(ctx context.Context, templateText string, vars type
 		// parameter types. Functions meant to apply to arguments of
 		// arbitrary type can use parameters of type interface{} or of
 		// type reflect.Value.
-		f, err := wrap(ctx, name, scaffold) // wrap it so that it meets API expectations
+		f, err := obj.wrap(ctx, name, scaffold) // wrap it so that it meets API expectations
 		if err != nil {
 			if obj.init.Debug {
 				obj.init.Logf("warning, skipping function named: `%s`, err: %v", name, err)
@@ -268,6 +276,7 @@ func (obj *TemplateFunc) run(ctx context.Context, templateText string, vars type
 
 	var err error
 	tmpl := template.New(TemplateName)
+	tmpl = tmpl.Option("missingkey=error") // avoid "<no value>" strings!
 	tmpl = tmpl.Funcs(funcMap)
 	tmpl, err = tmpl.Parse(templateText)
 	if err != nil {
@@ -312,31 +321,78 @@ func (obj *TemplateFunc) convert(v types.Value) (interface{}, error) {
 		return v.Value(), nil
 
 	case types.KindList:
-		// TODO: can we improve on this to expose indexes?
-		return v.Value(), nil
+		// If the element type reflects cleanly, return a concrete slice
+		// so it can still be passed to typed template functions.
+		if reflectable(v.Type()) {
+			// TODO: can we improve on this to expose indexes?
+			return v.Value(), nil
+		}
+		// Otherwise (eg: a list of structs with lowercase fields) we
+		// recurse so the elements become map[string]interface{}.
+		l := []interface{}{}
+		for _, x := range v.List() {
+			val, err := obj.convert(x)
+			if err != nil {
+				return nil, err
+			}
+			l = append(l, val)
+		}
+		return l, nil
 
 	case types.KindMap:
-		if v.Type().Key.Cmp(types.TypeStr) != nil {
-			return nil, fmt.Errorf("template: map keys must be str")
+		// The common case of str keys produces a map[string]interface{}
+		// so that template field access (eg: .key) keeps working even
+		// when the keys aren't valid (exported) golang identifiers.
+		if v.Type().Key.Cmp(types.TypeStr) == nil { // key type is str
+			m := make(map[string]interface{})
+			for k, v := range v.Map() { // map[Value]Value
+				val, err := obj.convert(v)
+				if err != nil {
+					return nil, err
+				}
+				m[k.Str()] = val
+			}
+			return m, nil
 		}
-		m := make(map[string]interface{})
+
+		// Otherwise build a real golang map so we can use comparable,
+		// non-str keys (eg: structs) and range over them in templates.
+		var m reflect.Value         // map[?]interface{}
 		for k, v := range v.Map() { // map[Value]Value
+			key, err := convertKey(k)
+			if err != nil {
+				return nil, err
+			}
 			val, err := obj.convert(v)
 			if err != nil {
 				return nil, err
 			}
-			m[k.Str()] = val
+			rk := reflect.ValueOf(key)
+			if !m.IsValid() { // first iteration
+				m = reflect.MakeMap(reflect.MapOf(rk.Type(), interfaceType))
+			}
+			m.SetMapIndex(rk, reflect.ValueOf(val))
 		}
-		return m, nil
+		if !m.IsValid() { // empty map
+			return map[string]interface{}{}, nil
+		}
+		return m.Interface(), nil
 
 	case types.KindStruct:
+		// Struct fields are always exposed under their Title-cased
+		// name. A struct used as a map key *must* be a real golang
+		// struct with exported (Title-cased) fields (golang map keys
+		// must be comparable) so we use the same naming here for
+		// consistency. This way every struct field is accessed the same
+		// way (eg: .Foo) regardless of whether the struct is a value,
+		// list element, function return value, or map key.
 		m := make(map[string]interface{})
 		for k, v := range v.Struct() { // map[string]Value
 			val, err := obj.convert(v)
 			if err != nil {
 				return nil, err
 			}
-			m[k] = val
+			m[strings.Title(k)] = val
 		}
 		return m, nil
 
@@ -351,10 +407,116 @@ func (obj *TemplateFunc) convert(v types.Value) (interface{}, error) {
 	}
 }
 
+// wrap builds a function in the format expected by the template engine, and
+// returns it as an interface{}. It does so by wrapping our type system and
+// function API with what is expected from the reflection API. It returns a
+// version that includes the optional second error return value so that our
+// functions can return errors without causing a panic.
+func (obj *TemplateFunc) wrap(ctx context.Context, name string, scaffold *simple.Scaffold) (_ interface{}, reterr error) {
+	defer func() {
+		// catch unhandled panics
+		if r := recover(); r != nil {
+			reterr = fmt.Errorf("panic in template wrap of `%s` function: %+v", name, r)
+		}
+	}()
+
+	if scaffold.T == nil {
+		panic("malformed type")
+	}
+	if scaffold.T.HasUni() {
+		panic("type not unified")
+	}
+	if scaffold.T.Map == nil {
+		panic("malformed func type")
+	}
+	if len(scaffold.T.Map) != len(scaffold.T.Ord) {
+		panic("malformed func length")
+	}
+	in := []reflect.Type{}
+	for _, k := range scaffold.T.Ord {
+		t, ok := scaffold.T.Map[k]
+		if !ok {
+			panic("malformed func order")
+		}
+		if t == nil {
+			panic("malformed func arg")
+		}
+
+		in = append(in, t.Reflect())
+	}
+	// If the return type isn't reflectable (eg: a struct with lowercase
+	// fields) we hand back an interface{} holding a map[string]interface{}
+	// instead, so that lowercase field access keeps working in templates.
+	canReflect := reflectable(scaffold.T.Out)
+	ret := interfaceType
+	if canReflect {
+		ret = scaffold.T.Out.Reflect()
+	}
+	out := []reflect.Type{ret, errorType}
+	var variadic = false // currently not supported in our function value
+	typ := reflect.FuncOf(in, out, variadic)
+
+	// wrap our function with the translation that is necessary
+	f := func(args []reflect.Value) (results []reflect.Value) { // build
+		innerArgs := []types.Value{}
+		zeroValue := reflect.Zero(ret) // zero value of return type
+		for _, x := range args {
+			v, err := types.ValueOf(x) // reflect.Value -> Value
+			if err != nil {
+				r := reflect.ValueOf(errwrap.Wrapf(err, "function `%s` errored", name))
+				if !r.Type().ConvertibleTo(errorType) { // for fun!
+					r = reflect.ValueOf(fmt.Errorf("function `%s` errored: %+v", name, err))
+				}
+				e := r.Convert(errorType) // must be seen as an `error`
+				return []reflect.Value{zeroValue, e}
+			}
+			innerArgs = append(innerArgs, v)
+		}
+
+		result, err := scaffold.F(ctx, innerArgs) // call it
+		if err != nil {                           // function errored :(
+			// errwrap is a better way to report errors, if allowed!
+			r := reflect.ValueOf(errwrap.Wrapf(err, "function `%s` errored", name))
+			if !r.Type().ConvertibleTo(errorType) { // for fun!
+				r = reflect.ValueOf(fmt.Errorf("function `%s` errored: %+v", name, err))
+			}
+			e := r.Convert(errorType) // must be seen as an `error`
+			return []reflect.Value{zeroValue, e}
+		} else if result == nil { // someone wrote a bad function
+			r := reflect.ValueOf(fmt.Errorf("function `%s` returned nil", name))
+			e := r.Convert(errorType) // must be seen as an `error`
+			return []reflect.Value{zeroValue, e}
+		}
+
+		nilError := reflect.Zero(errorType)
+		if canReflect {
+			return []reflect.Value{reflect.ValueOf(result.Value()), nilError}
+		}
+
+		// non-reflectable return: convert to map[string]interface{} etc.
+		val, err := obj.convert(result)
+		if err != nil {
+			r := reflect.ValueOf(errwrap.Wrapf(err, "function `%s` errored", name))
+			if !r.Type().ConvertibleTo(errorType) { // for fun!
+				r = reflect.ValueOf(fmt.Errorf("function `%s` errored: %+v", name, err))
+			}
+			e := r.Convert(errorType) // must be seen as an `error`
+			return []reflect.Value{zeroValue, e}
+		}
+		iv := reflect.New(interfaceType).Elem()
+		iv.Set(reflect.ValueOf(val))
+		return []reflect.Value{iv, nilError}
+	}
+	val := reflect.MakeFunc(typ, f)
+	return val.Interface(), nil
+}
+
 // Copy is implemented so that the obj.built value is not lost if we copy this
 // function.
 func (obj *TemplateFunc) Copy() interfaces.Func {
 	return &TemplateFunc{
+		Textarea: obj.Textarea,
+
 		Type:  obj.Type, // don't copy because we use this after unification
 		built: obj.built,
 
@@ -387,6 +549,88 @@ func (obj *TemplateFunc) Call(ctx context.Context, args []types.Value) (types.Va
 	}, nil
 }
 
+// reflectable returns true if the type can be passed through the golang reflect
+// API without panicking. It is false for any struct that contains an unexported
+// (lowercase) field name, since reflect.StructOf panics on those. In that case
+// we represent the value as a map[string]interface{} instead so that lowercase
+// field access keeps working inside templates.
+func reflectable(typ *types.Type) bool {
+	if typ == nil {
+		return false
+	}
+	switch typ.Kind {
+	case types.KindBool, types.KindStr, types.KindInt, types.KindFloat:
+		return true
+
+	case types.KindList:
+		return reflectable(typ.Val)
+
+	case types.KindMap:
+		return reflectable(typ.Key) && reflectable(typ.Val)
+
+	case types.KindStruct:
+		for _, k := range typ.Ord {
+			if strings.Title(k) != k { // unexported field
+				return false
+			}
+			if !reflectable(typ.Map[k]) {
+				return false
+			}
+		}
+		return true
+
+	case types.KindVariant:
+		return reflectable(typ.Var)
+	}
+
+	return false // something else (eg: func)
+}
+
+// convertKey is like convert, except it produces a comparable golang value that
+// is suitable for use as a map key inside a template. Maps aren't comparable in
+// golang, so structs are turned into real golang structs (with exported, titled
+// field names) instead of the map[string]interface{} that convert would
+// otherwise build.
+func convertKey(v types.Value) (interface{}, error) {
+	switch x := v.Type().Kind; x {
+	case types.KindBool:
+		fallthrough
+	case types.KindStr:
+		fallthrough
+	case types.KindInt:
+		fallthrough
+	case types.KindFloat:
+		return v.Value(), nil
+
+	case types.KindStruct:
+		fields := []reflect.StructField{}
+		vals := []reflect.Value{}
+		for _, k := range v.Type().Ord { // deterministic field order
+			val, err := convertKey(v.Struct()[k])
+			if err != nil {
+				return nil, err
+			}
+			rv := reflect.ValueOf(val)
+			fields = append(fields, reflect.StructField{
+				Name: strings.Title(k), // must be exported
+				Type: rv.Type(),
+			})
+			vals = append(vals, rv)
+		}
+		st := reflect.New(reflect.StructOf(fields)).Elem()
+		for i, rv := range vals {
+			st.Field(i).Set(rv)
+		}
+		return st.Interface(), nil
+
+	case types.KindVariant:
+		return convertKey(v.(*types.VariantValue).V) // un-nest
+
+	default:
+		return nil, fmt.Errorf("can't use `%+v` as a template map key", x)
+	}
+}
+
 // safename renames the functions so they're valid inside the template. This is
 // a limitation of the template library, and it might be worth moving to a new
 // one.
@@ -403,85 +647,4 @@ func safename(name string) string {
 		return char + name
 	}
 	return result
-}
-
-// wrap builds a function in the format expected by the template engine, and
-// returns it as an interface{}. It does so by wrapping our type system and
-// function API with what is expected from the reflection API. It returns a
-// version that includes the optional second error return value so that our
-// functions can return errors without causing a panic.
-func wrap(ctx context.Context, name string, scaffold *simple.Scaffold) (_ interface{}, reterr error) {
-	defer func() {
-		// catch unhandled panics
-		if r := recover(); r != nil {
-			reterr = fmt.Errorf("panic in template wrap of `%s` function: %+v", name, r)
-		}
-	}()
-
-	if scaffold.T == nil {
-		panic("malformed type")
-	}
-	if scaffold.T.HasUni() {
-		panic("type not unified")
-	}
-	if scaffold.T.Map == nil {
-		panic("malformed func type")
-	}
-	if len(scaffold.T.Map) != len(scaffold.T.Ord) {
-		panic("malformed func length")
-	}
-	in := []reflect.Type{}
-	for _, k := range scaffold.T.Ord {
-		t, ok := scaffold.T.Map[k]
-		if !ok {
-			panic("malformed func order")
-		}
-		if t == nil {
-			panic("malformed func arg")
-		}
-
-		in = append(in, t.Reflect())
-	}
-	ret := scaffold.T.Out.Reflect() // this can panic!
-	out := []reflect.Type{ret, errorType}
-	var variadic = false // currently not supported in our function value
-	typ := reflect.FuncOf(in, out, variadic)
-
-	// wrap our function with the translation that is necessary
-	f := func(args []reflect.Value) (results []reflect.Value) { // build
-		innerArgs := []types.Value{}
-		zeroValue := reflect.Zero(scaffold.T.Out.Reflect()) // zero value of return type
-		for _, x := range args {
-			v, err := types.ValueOf(x) // reflect.Value -> Value
-			if err != nil {
-				r := reflect.ValueOf(errwrap.Wrapf(err, "function `%s` errored", name))
-				if !r.Type().ConvertibleTo(errorType) { // for fun!
-					r = reflect.ValueOf(fmt.Errorf("function `%s` errored: %+v", name, err))
-				}
-				e := r.Convert(errorType) // must be seen as an `error`
-				return []reflect.Value{zeroValue, e}
-			}
-			innerArgs = append(innerArgs, v)
-		}
-
-		result, err := scaffold.F(ctx, innerArgs) // call it
-		if err != nil {                           // function errored :(
-			// errwrap is a better way to report errors, if allowed!
-			r := reflect.ValueOf(errwrap.Wrapf(err, "function `%s` errored", name))
-			if !r.Type().ConvertibleTo(errorType) { // for fun!
-				r = reflect.ValueOf(fmt.Errorf("function `%s` errored: %+v", name, err))
-			}
-			e := r.Convert(errorType) // must be seen as an `error`
-			return []reflect.Value{zeroValue, e}
-		} else if result == nil { // someone wrote a bad function
-			r := reflect.ValueOf(fmt.Errorf("function `%s` returned nil", name))
-			e := r.Convert(errorType) // must be seen as an `error`
-			return []reflect.Value{zeroValue, e}
-		}
-
-		nilError := reflect.Zero(errorType)
-		return []reflect.Value{reflect.ValueOf(result.Value()), nilError}
-	}
-	val := reflect.MakeFunc(typ, f)
-	return val.Interface(), nil
 }

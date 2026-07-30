@@ -95,7 +95,7 @@ type DHCPServerRes struct {
 	// addresses.
 	Address string `lang:"address" yaml:"address"`
 
-	// Interface is interface to bind to. For example `eth0` for the common
+	// Interface is interface to bind to. For example `meth0` for the common
 	// case. You may leave this field blank to not run any specific binding.
 	// XXX: You need to actually specify an interface here at the moment. :(
 	// BUG: https://github.com/insomniacslk/dhcp/issues/372
@@ -156,6 +156,9 @@ type DHCPServerRes struct {
 	reservedIPs map[netip.Addr]engine.Res // track which res reserved
 
 	// TODO: add in ipv6 support here or in a separate resource?
+
+	once  *sync.Once
+	start chan struct{} // closes by once
 }
 
 // Default returns some sensible defaults for this resource.
@@ -353,6 +356,10 @@ func (obj *DHCPServerRes) Validate() error {
 		}
 	}
 
+	if err := validateDHCPv4NBP(obj.NBP); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -437,6 +444,9 @@ func (obj *DHCPServerRes) Init(init *engine.Init) error {
 		}
 	}
 
+	obj.once = &sync.Once{}
+	obj.start = make(chan struct{})
+
 	return nil
 }
 
@@ -450,6 +460,9 @@ func (obj *DHCPServerRes) Cleanup() error {
 
 // Watch is the primary listener for this resource and it outputs events.
 func (obj *DHCPServerRes) Watch(ctx context.Context) error {
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(context.Canceled)
+
 	addr, err := net.ResolveUDPAddr("udp", obj.getAddress()) // *net.UDPAddr
 	if err != nil {
 		return errwrap.Wrapf(err, "could not resolve address")
@@ -473,23 +486,46 @@ func (obj *DHCPServerRes) Watch(ctx context.Context) error {
 
 	newLogger := &overEngineeredLogger{
 		logf: func(format string, v ...interface{}) {
+			// Once we've started exiting, the library logs the
+			// closed conn read garbage that we don't care about.
+			if s := fmt.Sprintf(format, v...); ctx.Err() != nil && strings.Contains(s, net.ErrClosed.Error()) {
+				return
+			}
 			obj.init.Logf(format, v...)
 		},
 	}
 	logOpt := server4.WithLogger(newLogger)
 	opts = append(opts, logOpt)
 
+	conn, err := server4.NewIPv4UDPConn(obj.Interface, addr)
+	if err != nil {
+		return errwrap.Wrapf(err, "could not start listener")
+	}
+	opts = append(opts, server4.WithConn(conn))
+
 	server, err := server4.NewServer(obj.Interface, addr, obj.handler4(), opts...)
 	if err != nil {
-		return errwrap.Wrapf(err, "could not start listener") // it's inside
+		_ = conn.Close()
+		return errwrap.Wrapf(err, "could not start listener")
 	}
 
-	obj.init.Running() // when started, notify engine that we're running
+	if err := obj.init.Event(ctx); err != nil {
+		_ = server.Close()
+		return err
+	}
+
+	select {
+	case <-obj.start: // opened by CheckApply after runtime checks succeed
+	case <-ctx.Done(): // closed by the engine to signal shutdown
+		_ = server.Close()
+		return context.Cause(ctx)
+	}
+	if err := dhcpDrainPacketConn(conn); err != nil {
+		_ = server.Close()
+		return errwrap.Wrapf(err, "could not drain queued packets")
+	}
 	//defer obj.mutex.RLock()
 	//obj.mutex.RUnlock() // it's safe to let CheckApply proceed
-
-	var closeError error
-	closeSignal := make(chan struct{})
 
 	wg := &sync.WaitGroup{}
 	defer wg.Wait()
@@ -497,40 +533,22 @@ func (obj *DHCPServerRes) Watch(ctx context.Context) error {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		defer close(closeSignal)
 
 		err := server.Serve() // blocks until Close() is called I hope!
 		// TODO: getting this error is probably a bug, please see:
 		// https://github.com/insomniacslk/dhcp/issues/376
 		isClosing := errors.Is(err, net.ErrClosed)
 		if err == nil || isClosing {
+			cancel(nil)
 			return
 		}
-		// if this returned on its own, then closeSignal can be used...
-		closeError = errwrap.Wrapf(err, "the server errored")
+		cancel(errwrap.Wrapf(err, "the server errored"))
 	}()
 	defer server.Close()
 
-	startupChan := make(chan struct{})
-	close(startupChan) // send one initial signal
-
-	for {
-		if obj.init.Debug {
-			obj.init.Logf("Looping...")
-		}
-
-		select {
-		case <-startupChan:
-			startupChan = nil
-
-		case <-closeSignal: // something shut us down early
-			return closeError
-
-		case <-ctx.Done(): // closed by the engine to signal shutdown
-			return nil
-		}
-
-		obj.init.Event() // notify engine of an event (this can block)
+	select {
+	case <-ctx.Done(): // closed by the engine to signal shutdown
+		return context.Cause(ctx)
 	}
 }
 
@@ -588,6 +606,19 @@ func (obj *DHCPServerRes) CheckApply(ctx context.Context, apply bool) (bool, err
 		return false, err
 	} else if !c {
 		checkOK = false
+	}
+
+	// TODO: If we ever want to do something in the children CheckApply...
+	//for _, res := range obj.GetGroup() { // grouped elements
+	//	if c, err := res.CheckApply(ctx, apply); err != nil {
+	//		return false, errwrap.Wrapf(err, "autogrouped CheckApply failed")
+	//	} else if !c {
+	//		checkOK = false
+	//	}
+	//}
+
+	if checkOK {
+		obj.once.Do(func() { close(obj.start) })
 	}
 
 	return checkOK, nil // almost always succeeds, with nothing to do!
@@ -798,7 +829,7 @@ func (obj *DHCPServerRes) serverIDHandler4(req, resp *dhcpv4.DHCPv4) (*dhcpv4.DH
 		var err error
 		if obj.serverID, err = obj.getServerID(); err != nil {
 			obj.init.Logf("could not determine the ServerID during runtime")
-			return resp, false
+			return nil, true
 		}
 	}
 
@@ -1055,8 +1086,6 @@ type DHCPHostRes struct {
 
 	ipv4Addr net.IP // XXX: port to netip.Addr
 	ipv4Mask net.IPMask
-	opt66    *dhcpv4.Option
-	opt67    *dhcpv4.Option
 }
 
 // Default returns some sensible defaults for this resource.
@@ -1089,19 +1118,8 @@ func (obj *DHCPHostRes) Validate() error {
 	//	return fmt.Errorf("only IPv4 is currently supported")
 	//}
 
-	// validate the network boot program URL
-	if obj.NBP != "" {
-		u, err := url.Parse(obj.NBP)
-		if err != nil {
-			return errwrap.Wrapf(err, "invalid nbp URL")
-		}
-		if u.Scheme == "" {
-			return fmt.Errorf("missing nbp scheme")
-		}
-		// TODO: remove this check when we support DHCPv6
-		if u.Scheme != "tftp" {
-			return fmt.Errorf("the scheme must be `tftp` for DHCPv4")
-		}
+	if err := validateDHCPv4NBP(obj.NBP); err != nil {
+		return err
 	}
 
 	return nil
@@ -1134,15 +1152,15 @@ func (obj *DHCPHostRes) Cleanup() error {
 // particular one does absolutely nothing but block until we've received a done
 // signal.
 func (obj *DHCPHostRes) Watch(ctx context.Context) error {
-	obj.init.Running() // when started, notify engine that we're running
+	if err := obj.init.Event(ctx); err != nil {
+		return err
+	}
 
 	select {
 	case <-ctx.Done(): // closed by the engine to signal shutdown
 	}
 
-	//obj.init.Event() // notify engine of an event (this can block)
-
-	return nil
+	return ctx.Err()
 }
 
 // CheckApply never has anything to do for this resource, so it always succeeds.
@@ -1219,14 +1237,15 @@ func (obj *DHCPHostRes) handler4(data *HostData) (func(*dhcpv4.DHCPv4, *dhcpv4.D
 		return nil, errwrap.Wrapf(err, "unexpected invalid nbp URL")
 	}
 	otsn := dhcpv4.OptTFTPServerName(result.Host)
-	obj.opt66 = &otsn
+	opt66 := &otsn
 	p := result.Path
 	if obj.NBPPath != "" { // override the path if this is specified
 		p = obj.NBPPath
 	}
 	obfn := dhcpv4.OptBootFileName(p)
+	var opt67 *dhcpv4.Option
 	if p != "" {
-		obj.opt67 = &obfn
+		opt67 = &obfn
 	}
 
 	return func(req, resp *dhcpv4.DHCPv4) (*dhcpv4.DHCPv4, bool) {
@@ -1254,14 +1273,14 @@ func (obj *DHCPHostRes) handler4(data *HostData) (func(*dhcpv4.DHCPv4, *dhcpv4.D
 		resp.Options.Update(dhcpv4.OptSubnetMask(obj.ipv4Mask)) // net.IPMask
 
 		// nbp section
-		if obj.opt66 != nil && req.IsOptionRequested(dhcpv4.OptionTFTPServerName) {
-			resp.Options.Update(*obj.opt66)
+		if opt66 != nil && req.IsOptionRequested(dhcpv4.OptionTFTPServerName) {
+			resp.Options.Update(*opt66)
 		}
-		if obj.opt67 != nil && req.IsOptionRequested(dhcpv4.OptionBootfileName) {
-			resp.Options.Update(*obj.opt67)
+		if opt67 != nil && req.IsOptionRequested(dhcpv4.OptionBootfileName) {
+			resp.Options.Update(*opt67)
 		}
 		if obj.init.Debug {
-			obj.init.Logf("Added NBP %s / %s to request", obj.opt66, obj.opt67)
+			obj.init.Logf("Added NBP %s / %s to request", opt66, opt67)
 		}
 
 		return resp, true
@@ -1373,9 +1392,6 @@ type DHCPRangeRes struct {
 	to   netip.Addr
 	mask net.IPMask
 	skip []netip.Addr
-
-	opt66 *dhcpv4.Option
-	opt67 *dhcpv4.Option
 }
 
 // Default returns some sensible defaults for this resource.
@@ -1596,19 +1612,8 @@ func (obj *DHCPRangeRes) Validate() error {
 		return err
 	}
 
-	// validate the network boot program URL
-	if obj.NBP != "" {
-		u, err := url.Parse(obj.NBP)
-		if err != nil {
-			return errwrap.Wrapf(err, "invalid nbp URL")
-		}
-		if u.Scheme == "" {
-			return fmt.Errorf("missing nbp scheme")
-		}
-		// TODO: remove this check when we support DHCPv6
-		if u.Scheme != "tftp" {
-			return fmt.Errorf("the scheme must be `tftp` for DHCPv4")
-		}
+	if err := validateDHCPv4NBP(obj.NBP); err != nil {
+		return err
 	}
 
 	return nil
@@ -1642,7 +1647,7 @@ func (obj *DHCPRangeRes) Init(init *engine.Init) error {
 	to := net.IP(obj.to.AsSlice())
 	allocator, err := bitmap.NewIPv4Allocator(from, to)
 	if err != nil {
-		return nil
+		return errwrap.Wrapf(err, "could not create allocator")
 	}
 	obj.allocator = allocator
 	obj.mutex = &sync.Mutex{}
@@ -1727,15 +1732,15 @@ func (obj *DHCPRangeRes) Cleanup() error {
 // particular one does absolutely nothing but block until we've received a done
 // signal.
 func (obj *DHCPRangeRes) Watch(ctx context.Context) error {
-	obj.init.Running() // when started, notify engine that we're running
+	if err := obj.init.Event(ctx); err != nil {
+		return err
+	}
 
 	select {
 	case <-ctx.Done(): // closed by the engine to signal shutdown
 	}
 
-	//obj.init.Event() // notify engine of an event (this can block)
-
-	return nil
+	return ctx.Err()
 }
 
 // CheckApply never has anything to do for this resource, so it always succeeds.
@@ -1837,14 +1842,15 @@ func (obj *DHCPRangeRes) handler4(data *HostData) (func(*dhcpv4.DHCPv4, *dhcpv4.
 		return nil, errwrap.Wrapf(err, "unexpected invalid nbp URL")
 	}
 	otsn := dhcpv4.OptTFTPServerName(result.Host)
-	obj.opt66 = &otsn
+	opt66 := &otsn
 	p := result.Path
 	if obj.NBPPath != "" { // override the path if this is specified
 		p = obj.NBPPath
 	}
 	obfn := dhcpv4.OptBootFileName(p)
+	var opt67 *dhcpv4.Option
 	if p != "" {
-		obj.opt67 = &obfn
+		opt67 = &obfn
 	}
 
 	res, ok := obj.Parent().(*DHCPServerRes)
@@ -1935,14 +1941,14 @@ func (obj *DHCPRangeRes) handler4(data *HostData) (func(*dhcpv4.DHCPv4, *dhcpv4.
 		resp.Options.Update(dhcpv4.OptSubnetMask(obj.mask)) // net.IPMask
 
 		// nbp section
-		if obj.opt66 != nil && req.IsOptionRequested(dhcpv4.OptionTFTPServerName) {
-			resp.Options.Update(*obj.opt66)
+		if opt66 != nil && req.IsOptionRequested(dhcpv4.OptionTFTPServerName) {
+			resp.Options.Update(*opt66)
 		}
-		if obj.opt67 != nil && req.IsOptionRequested(dhcpv4.OptionBootfileName) {
-			resp.Options.Update(*obj.opt67)
+		if opt67 != nil && req.IsOptionRequested(dhcpv4.OptionBootfileName) {
+			resp.Options.Update(*opt67)
 		}
 		if obj.init.Debug {
-			obj.init.Logf("Added NBP %s / %s to request", obj.opt66, obj.opt67)
+			obj.init.Logf("Added NBP %s / %s to request", opt66, opt67)
 		}
 
 		return resp, true
@@ -1961,7 +1967,7 @@ func (obj *DHCPRangeRes) leaseClean() (time.Duration, error) {
 	for mac, record := range obj.records { // see who is expired...
 		expiry := time.Unix(int64(record.Expires), 0) // 0 is nsec
 		//if !expiry.After(now) // same
-		if delta := expiry.Sub(now); delta > 0 { // positive if expired
+		if delta := expiry.Sub(now); delta > 0 { // positive if not expired
 			if min == -1 { // initialize
 				min = delta
 			}
@@ -2053,4 +2059,45 @@ func checkValidNetmask(netmask net.IPMask) bool {
 // 255.255.255.0 instead of ffffff00 which is what's seen when you print it now.
 func netmaskAsQuadString(netmask net.IPMask) string {
 	return fmt.Sprintf("%d.%d.%d.%d", netmask[0], netmask[1], netmask[2], netmask[3])
+}
+
+// validateDHCPv4NBP is a simpler validator for the network boot program URL.
+func validateDHCPv4NBP(nbp string) error {
+	if nbp == "" {
+		return nil
+	}
+
+	u, err := url.Parse(nbp)
+	if err != nil {
+		return errwrap.Wrapf(err, "invalid nbp URL")
+	}
+	if u.Scheme == "" {
+		return fmt.Errorf("missing nbp scheme")
+	}
+	// TODO: remove this check when we support DHCPv6.
+	if u.Scheme != "tftp" {
+		return fmt.Errorf("the scheme must be `tftp` for DHCPv4")
+	}
+
+	return nil
+}
+
+// dhcpDrainPacketConn discards datagrams queued while Watch was waiting for the
+// first successful CheckApply. Those requests arrived before the resource was
+// allowed to serve, so they must not be handled after the gate opens.
+func dhcpDrainPacketConn(conn net.PacketConn) error {
+	if err := conn.SetReadDeadline(time.Now().Add(time.Millisecond)); err != nil {
+		return err
+	}
+	defer conn.SetReadDeadline(time.Time{})
+
+	buf := make([]byte, 64*1024)
+	for {
+		if _, _, err := conn.ReadFrom(buf); err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				return nil
+			}
+			return err
+		}
+	}
 }

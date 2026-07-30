@@ -491,6 +491,7 @@ func (obj *GAPI) Cli(info *gapi.Info) (*gapi.Deploy, error) {
 		Sema: info.Flags.Sema,
 
 		NoAutoEdges: info.Flags.NoAutoEdges,
+		NoAutoGroup: info.Flags.NoAutoGroup,
 
 		GAPI: &GAPI{
 			InputURI: fs.URI(),
@@ -519,7 +520,7 @@ func (obj *GAPI) Init(data *gapi.Data) error {
 		return fmt.Errorf("stdin passthrough is not supported at this time")
 	}
 
-	fs, err := obj.data.World.Fs(obj.InputURI) // open the remote file system
+	fs, err := obj.data.World.Fs(context.TODO(), obj.InputURI) // open the remote file system
 	if err != nil {
 		return errwrap.Wrapf(err, "can't load code from file system `%s`", obj.InputURI)
 	}

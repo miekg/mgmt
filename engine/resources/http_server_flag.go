@@ -146,6 +146,11 @@ func (obj *HTTPServerFlagRes) ServeHTTP(w http.ResponseWriter, req *http.Request
 		return
 	}
 
+	// Limit the request body size before parsing the form, to avoid memory
+	// exhaustion from an oversized POST. Flag values are small key/value
+	// pairs.
+	req.Body = http.MaxBytesReader(w, req.Body, 4*1024*1024) // 4 MiB
+
 	//requestPath := req.URL.Path
 	//if err := req.ParseForm(); err != nil { // needed to access querystring
 	//	sendHTTPError(w, err)
@@ -226,8 +231,7 @@ func (obj *HTTPServerFlagRes) Init(init *engine.Init) error {
 			Hostname: obj.init.Hostname,
 
 			// Watch:
-			//Running: event,
-			//Event:   event,
+			//Event: event,
 
 			// CheckApply:
 			//Refresh: func() bool {
@@ -276,10 +280,9 @@ func (obj *HTTPServerFlagRes) Cleanup() error {
 // and notifies the engine so that CheckApply can then run and return the
 // correct value on send/recv.
 func (obj *HTTPServerFlagRes) Watch(ctx context.Context) error {
-	obj.init.Running() // when started, notify engine that we're running
-
-	startupChan := make(chan struct{})
-	close(startupChan) // send one initial signal
+	if err := obj.init.Event(ctx); err != nil {
+		return err
+	}
 
 	for {
 		if obj.init.Debug {
@@ -287,9 +290,6 @@ func (obj *HTTPServerFlagRes) Watch(ctx context.Context) error {
 		}
 
 		select {
-		case <-startupChan:
-			startupChan = nil
-
 		case err, ok := <-obj.eventStream:
 			if !ok { // shouldn't happen
 				obj.eventStream = nil
@@ -300,10 +300,12 @@ func (obj *HTTPServerFlagRes) Watch(ctx context.Context) error {
 			}
 
 		case <-ctx.Done(): // closed by the engine to signal shutdown
-			return nil
+			return ctx.Err()
 		}
 
-		obj.init.Event() // notify engine of an event (this can block)
+		if err := obj.init.Event(ctx); err != nil {
+			return err
+		}
 	}
 }
 

@@ -43,7 +43,7 @@ import (
 	"github.com/purpleidea/mgmt/util/errwrap"
 
 	etcd "go.etcd.io/etcd/client/v3"
-	etcdutil "go.etcd.io/etcd/client/v3/clientv3util"
+	etcdUtil "go.etcd.io/etcd/client/v3/clientv3util"
 )
 
 func init() {
@@ -68,8 +68,11 @@ type File struct {
 	cursor    int64
 	dirCursor int64
 
-	readOnly bool // is the file read-only?
-	closed   bool // is file closed?
+	readOnly  bool // is the file read-only?
+	writeOnly bool // is the file write-only?
+	append    bool // should writes always append?
+	closed    bool // is the file closed?
+	dataDirty bool // did the file content change since last successful push?
 }
 
 // path returns the expected path to the actual file in etcd.
@@ -100,13 +103,14 @@ func (obj *File) cache() error {
 		return err
 	}
 	if result == nil || len(result) == 0 { // nothing found
-		return err
+		return fmt.Errorf("got empty data")
 	}
 	data, exists := result[p]
 	if !exists {
 		return fmt.Errorf("could not find data") // programming error?
 	}
 	obj.data = data // save
+	obj.dataDirty = false
 	return nil
 }
 
@@ -163,10 +167,11 @@ func fileCreate(fs *Fs, name string) (*File, error) {
 	}
 
 	f = &File{
-		fs:   fs,
-		Path: filePath, // the relative path chunk (not incl. dir name)
-		Hash: h,
-		data: data,
+		fs:        fs,
+		Path:      filePath, // the relative path chunk (not incl. dir name)
+		Hash:      h,
+		data:      data,
+		dataDirty: true, // empty blob may not yet exist on the server
 	}
 
 	// add to parent
@@ -213,14 +218,15 @@ func fileOpen(fs *Fs, name string) (*File, error) {
 	return node, nil
 }
 
-// Close closes the file handle. This will try and run Sync automatically.
+// Close closes the file handle. This will try and run Sync automatically for
+// files that may have been mutated; read-only handles haven't touched either
+// data or metadata, so Sync is skipped entirely on close.
 func (obj *File) Close() error {
 	if !obj.readOnly {
 		obj.ModTime = time.Now()
-	}
-
-	if err := obj.Sync(); err != nil {
-		return err
+		if err := obj.Sync(); err != nil {
+			return err
+		}
 	}
 
 	// FIXME: there is a big implementation mistake between the metadata
@@ -239,6 +245,8 @@ func (obj *File) Close() error {
 	//obj.data = nil
 	obj.cursor = 0
 	obj.readOnly = false
+	obj.writeOnly = false
+	obj.append = false
 
 	obj.closed = true
 	return nil
@@ -260,8 +268,11 @@ func (obj *File) Stat() (os.FileInfo, error) {
 	}, nil
 }
 
-// Sync flushes the file contents to the server and calls the filesystem
-// metadata sync as well.
+// Sync flushes the file contents (if they have changed) to the server and calls
+// the filesystem metadata sync as well. Directories carry no payload and skip
+// the data txn unconditionally. Files whose content hasn't changed since the
+// last successful push (chmod-only, close-after-read, no-op truncate, etc) also
+// skip the data txn since only the metadata is touched.
 // FIXME: instead of a txn, run a get and then a put in two separate stages. if
 // the get already found the data up there, then we don't need to push it all in
 // the put phase. with the txn it is always all sent up even if the put is never
@@ -273,10 +284,15 @@ func (obj *File) Sync() error {
 		return ErrFileClosed
 	}
 
+	if obj.Mode.IsDir() || !obj.dataDirty {
+		obj.dataDirty = false // redundant
+		return obj.fs.sync()  // push metadata up to server (may be deferred)
+	}
+
 	p := obj.path() // store file data at this path in etcd
 
 	//cmp := etcd.Compare(etcd.Version(p), "=", 0) // KeyMissing
-	cmp := etcdutil.KeyMissing(p)
+	cmp := etcdUtil.KeyMissing(p)
 	op := etcd.OpPut(p, string(obj.data)) // this pushes contents to server
 
 	// it's important to do this in one transaction, and atomically, because
@@ -291,10 +307,8 @@ func (obj *File) Sync() error {
 		}
 	}
 
-	if err := obj.fs.sync(); err != nil { // push metadata up to server
-		return err
-	}
-	return nil
+	obj.dataDirty = false
+	return obj.fs.sync() // push metadata up to server (may be deferred)
 }
 
 // Truncate trims the file to the requested size. Since our file system can only
@@ -318,6 +332,11 @@ func (obj *File) Truncate(size int64) error {
 		}
 	}
 
+	if size == int64(len(obj.data)) {
+		// no-op: nothing changed, skip the metadata churn entirely
+		return nil
+	}
+
 	if size > int64(len(obj.data)) {
 		diff := size - int64(len(obj.data))
 		obj.data = append(obj.data, bytes.Repeat([]byte{00}, int(diff))...)
@@ -325,11 +344,14 @@ func (obj *File) Truncate(size int64) error {
 		obj.data = obj.data[0:size]
 	}
 
+	oldHash := obj.Hash
 	h, err := obj.fs.hash(obj.data) // update hash
 	if err != nil {
 		return err
 	}
 	obj.Hash = h
+	obj.dataDirty = obj.dataDirty || h != oldHash
+
 	obj.ModTime = time.Now()
 
 	// this pushes the new data and metadata up to etcd
@@ -343,6 +365,9 @@ func (obj *File) Read(b []byte) (n int, err error) {
 	if obj.closed {
 		return 0, ErrFileClosed
 	}
+	if obj.writeOnly {
+		return 0, &os.PathError{Op: "read", Path: obj.Path, Err: ErrFileWriteOnly}
+	}
 	if obj.Mode.IsDir() {
 		return 0, fmt.Errorf("file is a directory")
 	}
@@ -354,7 +379,7 @@ func (obj *File) Read(b []byte) (n int, err error) {
 
 	// TODO: can we optimize by reading just the length from etcd, and also
 	// by only downloading the data range we're interested in?
-	if len(b) > 0 && int(obj.cursor) == len(obj.data) {
+	if len(b) > 0 && int(obj.cursor) >= len(obj.data) {
 		return 0, io.EOF
 	}
 	if len(obj.data)-int(obj.cursor) >= len(b) {
@@ -372,13 +397,27 @@ func (obj *File) Read(b []byte) (n int, err error) {
 // returns the number of bytes read and the error, if any. ReadAt always returns
 // a non-nil error when n < len(b). At end of file, that error is io.EOF.
 func (obj *File) ReadAt(b []byte, off int64) (n int, err error) {
+	if off < 0 {
+		return 0, ErrOutOfRange
+	}
+	cursor := obj.cursor
+	defer func() {
+		obj.cursor = cursor
+	}()
 	obj.cursor = off
-	return obj.Read(b)
+	n, err = obj.Read(b)
+	if err == nil && n < len(b) {
+		err = io.EOF
+	}
+	return
 }
 
 // Readdir lists the contents of the directory and returns a list of file info
 // objects for each entry.
 func (obj *File) Readdir(count int) ([]os.FileInfo, error) {
+	if obj.closed {
+		return nil, ErrFileClosed
+	}
 	if !obj.Mode.IsDir() {
 		return nil, &os.PathError{Op: "readdir", Path: obj.Name(), Err: syscall.ENOTDIR}
 	}
@@ -439,18 +478,25 @@ func (obj *File) Seek(offset int64, whence int) (int64, error) {
 		return 0, ErrFileClosed
 	}
 
+	var cursor int64
 	switch whence {
 	case io.SeekStart: // 0
-		obj.cursor = offset
+		cursor = offset
 	case io.SeekCurrent: // 1
-		obj.cursor += offset
+		cursor = obj.cursor + offset
 	case io.SeekEnd: // 2
 		// download file contents into obj.data
 		if err := obj.cache(); err != nil {
 			return 0, err // TODO: -1 ?
 		}
-		obj.cursor = int64(len(obj.data)) + offset
+		cursor = int64(len(obj.data)) + offset
+	default:
+		return 0, fmt.Errorf("invalid whence")
 	}
+	if cursor < 0 {
+		return 0, ErrOutOfRange
+	}
+	obj.cursor = cursor
 	return obj.cursor, nil
 }
 
@@ -467,6 +513,9 @@ func (obj *File) Write(b []byte) (n int, err error) {
 	if err := obj.cache(); err != nil {
 		return 0, err // TODO: -1 ?
 	}
+	if obj.append {
+		obj.cursor = int64(len(obj.data))
+	}
 
 	// calculate the write
 	n = len(b)
@@ -479,18 +528,22 @@ func (obj *File) Write(b []byte) (n int, err error) {
 	}
 
 	if diff > 0 {
-		obj.data = append(bytes.Repeat([]byte{00}, int(diff)), b...)
+		obj.data = append(obj.data, bytes.Repeat([]byte{00}, int(diff))...)
+		obj.data = append(obj.data, b...)
 		obj.data = append(obj.data, tail...)
 	} else {
 		obj.data = append(obj.data[:cur], b...)
 		obj.data = append(obj.data, tail...)
 	}
 
+	oldHash := obj.Hash
 	h, err := obj.fs.hash(obj.data) // update hash
 	if err != nil {
 		return 0, err // TODO: -1 ?
 	}
 	obj.Hash = h
+	obj.dataDirty = obj.dataDirty || h != oldHash
+
 	obj.ModTime = time.Now()
 
 	// this pushes the new data and metadata up to etcd
@@ -498,12 +551,22 @@ func (obj *File) Write(b []byte) (n int, err error) {
 		return 0, err // TODO: -1 ?
 	}
 
-	obj.cursor = int64(len(obj.data))
+	obj.cursor = cur + int64(n)
 	return
 }
 
 // WriteAt writes into the given file at a certain offset.
 func (obj *File) WriteAt(b []byte, off int64) (n int, err error) {
+	if off < 0 {
+		return 0, ErrOutOfRange
+	}
+	if obj.append {
+		return 0, fmt.Errorf("file is opened in append mode")
+	}
+	cursor := obj.cursor
+	defer func() {
+		obj.cursor = cursor
+	}()
 	obj.cursor = off
 	return obj.Write(b)
 }

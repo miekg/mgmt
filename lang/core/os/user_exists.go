@@ -58,6 +58,8 @@ func init() {
 // UserExistsFunc is a function that determines if a linux user exists. It only
 // looks at /etc/passwd at this time.
 type UserExistsFunc struct {
+	interfaces.Textarea
+
 	init *interfaces.Init
 	last types.Value // last value received to use for diff
 }
@@ -122,6 +124,10 @@ func (obj *UserExistsFunc) Stream(ctx context.Context) error {
 		case event, ok := <-recWatcher.Events():
 			if !ok {
 				return fmt.Errorf("no more events")
+			}
+			if event == nil {
+				// programming error
+				return fmt.Errorf("unexpected nil recwatch event")
 			}
 			if err := event.Error; err != nil {
 				return errwrap.Wrapf(err, "error event received")

@@ -39,7 +39,7 @@ import (
 // It returns an empty string if a specific name was not found.
 func LookupSubcommand(obj interface{}, st interface{}) string {
 	val := reflect.ValueOf(obj)
-	if val.Kind() == reflect.Ptr { // max one de-referencing
+	if val.Kind() == reflect.Pointer { // max one de-referencing
 		val = val.Elem()
 	}
 
@@ -105,53 +105,6 @@ type YamlArgs struct {
 	Input string `arg:"positional,required"`
 }
 
-// PuppetArgs is the puppet CLI parsing structure and type of the parsed result.
-type PuppetArgs struct {
-	// Input is the input puppet code or file path or just "agent".
-	Input string `arg:"positional,required"`
-
-	// PuppetConf is the optional path to a puppet.conf config file.
-	PuppetConf string `arg:"--puppet-conf" help:"full path to the puppet.conf file to use"`
-}
-
-// LangPuppetArgs is the langpuppet CLI parsing structure and type of the parsed
-// result.
-type LangPuppetArgs struct {
-	// LangInput is the input mcl code or file path or any input specification.
-	LangInput string `arg:"--lang,required" help:"the input parameter for the lang module"`
-
-	// PuppetInput is the input puppet code or file path or just "agent".
-	PuppetInput string `arg:"--puppet,required" help:"the input parameter for the puppet module"`
-
-	// copy-pasted from PuppetArgs
-
-	// PuppetConf is the optional path to a puppet.conf config file.
-	PuppetConf string `arg:"--puppet-conf" help:"full path to the puppet.conf file to use"`
-
-	// end PuppetArgs
-
-	// copy-pasted from LangArgs
-
-	// TODO: removed (temporarily?)
-	//Stdin bool `arg:"--stdin" help:"use passthrough stdin"`
-
-	Download     bool `arg:"--download" help:"download any missing imports"`
-	OnlyDownload bool `arg:"--only-download" help:"stop after downloading any missing imports"`
-	Update       bool `arg:"--update" help:"update all dependencies to the latest versions"`
-
-	OnlyUnify bool `arg:"--only-unify" help:"stop after type unification"`
-	SkipUnify bool `arg:"--skip-unify" help:"skip type unification"`
-
-	Depth int `arg:"--depth" default:"-1" help:"max recursion depth limit (-1 is unlimited)"`
-
-	// The default of 0 means any error is a failure by default.
-	Retry int `arg:"--depth" help:"max number of retries (-1 is unlimited)"`
-
-	ModulePath string `arg:"--module-path,env:MGMT_MODULE_PATH" help:"choose the modules path (absolute)"`
-
-	// end LangArgs
-}
-
 // SetupPkgArgs is the setup service CLI parsing structure and type of the
 // parsed result.
 type SetupPkgArgs struct {
@@ -166,6 +119,7 @@ type SetupSvcArgs struct {
 	BinaryPath string `arg:"--binary-path" help:"path to the binary"`
 	SSHURL     string `arg:"--ssh-url" help:"transport the etcd client connection over SSH to this server"`
 	SSHHostKey string `arg:"--ssh-hostkey" help:"use this ssh known hosts key when connecting over SSH"`
+	SSHID      string `arg:"--ssh-id" help:"private key for SSH client auth"`
 
 	Seeds []string `arg:"--seeds,separate,env:MGMT_SEEDS" help:"default etcd client endpoints"`
 

@@ -40,6 +40,7 @@ import (
 	"os/user"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -55,6 +56,14 @@ import (
 func init() {
 	engine.RegisterResource("exec", func() engine.Res { return &ExecRes{} })
 }
+
+var _ engine.EdgeableRes = &ExecRes{} // compile time check
+
+const (
+	// execCmdWaitDelay is how long we give a cancelled command to close its
+	// I/O pipes before we stop waiting for it.
+	execCmdWaitDelay = 10 * time.Second // TODO: is this too long?
+)
 
 // ExecRes is an exec resource for running commands.
 //
@@ -97,15 +106,10 @@ type ExecRes struct {
 	Cwd string `lang:"cwd" yaml:"cwd"`
 
 	// Shell is the (optional) shell to use to run the cmd. If you specify
-	// this, then you can't use the Args parameter. Note that unless you
-	// use absolute paths, or set the PATH variable, the shell might not be
-	// able to find the program you're trying to run.
+	// this, then you can't use the Args parameter. Note that unless you use
+	// absolute paths, or set the PATH variable, the shell might not be able
+	// to find the program you're trying to run.
 	Shell string `lang:"shell" yaml:"shell"`
-
-	// Timeout is the number of seconds to wait before sending a Kill to the
-	// running command. If the Kill is received before the process exits,
-	// then this be treated as an error.
-	Timeout uint64 `lang:"timeout" yaml:"timeout"`
 
 	// Env allows the user to specify environment variables for script
 	// execution. These are taken using a map of format of VAR_KEY -> value.
@@ -149,6 +153,12 @@ type ExecRes struct {
 	// if the output includes a trailing newline or not. (Hint: it usually
 	// does!)
 	IfEquals *string `lang:"ifequals" yaml:"ifequals"`
+
+	// IfEqualsStdout is like IfEquals, except that it only compares against
+	// the stdout of the ifcmd, instead of against the combined stdout and
+	// stderr. This is useful when the ifcmd might print warnings to stderr
+	// which shouldn't factor into the comparison.
+	IfEqualsStdout *string `lang:"ifequals_stdout" yaml:"ifequals_stdout"`
 
 	// NIfCmd is the command that runs to guard against running the Cmd. If
 	// this command succeeds, then Cmd *will* be blocked from running. If
@@ -249,6 +259,49 @@ func (obj *ExecRes) getCmd() string {
 	return obj.Name()
 }
 
+// validateUserGroup is just a small helper that is used by Validate().
+func (obj *ExecRes) validateUserGroup() error {
+
+	// Check that if a user or group is set, we are running as root, or
+	// already running with the requested user/group.
+	if obj.User == "" && obj.Group == "" {
+		return nil
+	}
+
+	currentUser, err := user.Current()
+	if err != nil {
+		return errwrap.Wrapf(err, "error looking up current user")
+	}
+
+	if currentUser.Uid == "0" {
+		return nil // changing to any user is allowed since we're root!
+	}
+	//if currentUser.Gid == "0" { // XXX: Do we want to add this case too?
+	//	return nil
+	//}
+
+	if obj.User != "" {
+		uid, err := engineUtil.GetUID(obj.User)
+		if err != nil {
+			return errwrap.Wrapf(err, "error looking up uid for %s", obj.User)
+		}
+		if strconv.Itoa(uid) != currentUser.Uid {
+			return fmt.Errorf("running as root is required if you want to use exec with a different user")
+		}
+	}
+	if obj.Group != "" {
+		gid, err := engineUtil.GetGID(obj.Group)
+		if err != nil {
+			return errwrap.Wrapf(err, "error looking up gid for %s", obj.Group)
+		}
+		if strconv.Itoa(gid) != currentUser.Gid {
+			return fmt.Errorf("running as root is required if you want to use exec with a different group")
+		}
+	}
+
+	return nil
+}
+
 // Validate if the params passed in are valid data.
 func (obj *ExecRes) Validate() error {
 	if obj.getCmd() == "" { // this is the only thing that is really required
@@ -279,15 +332,8 @@ func (obj *ExecRes) Validate() error {
 		}
 	}
 
-	// check that, if a user or a group is set, we're running as root
-	if obj.User != "" || obj.Group != "" {
-		currentUser, err := user.Current()
-		if err != nil {
-			return errwrap.Wrapf(err, "error looking up current user")
-		}
-		if currentUser.Uid != "0" {
-			return fmt.Errorf("running as root is required if you want to use exec with a different user/group")
-		}
+	if err := obj.validateUserGroup(); err != nil {
+		return err
 	}
 
 	// check that environment variables' format is valid
@@ -322,11 +368,10 @@ func (obj *ExecRes) Cleanup() error {
 
 // Watch is the primary listener for this resource and it outputs events.
 func (obj *ExecRes) Watch(ctx context.Context) error {
-	wg := &sync.WaitGroup{}
-	defer wg.Wait()
+	defer obj.wg.Wait()
 
 	ioChan := make(chan *cmdOutput)
-	filesChan := make(chan recwatch.Event)
+	filesChan := make(chan *recwatch.Event)
 
 	var watchCmd *exec.Cmd
 	if obj.WatchCmd != "" {
@@ -366,6 +411,7 @@ func (obj *ExecRes) Watch(ctx context.Context) error {
 			Setpgid: true,
 			Pgid:    0,
 		}
+		cmdSetupCancel(cmd)
 		watchCmd = cmd // store for errors
 
 		// if we have a user and group, use them
@@ -393,11 +439,11 @@ func (obj *ExecRes) Watch(ctx context.Context) error {
 		}
 		defer recWatcher.Close()
 
-		wg.Add(1)
+		obj.wg.Add(1)
 		go func() {
-			defer wg.Done()
+			defer obj.wg.Done()
 			for {
-				var files recwatch.Event
+				var files *recwatch.Event
 				var ok bool
 				var shutdown bool
 
@@ -409,7 +455,7 @@ func (obj *ExecRes) Watch(ctx context.Context) error {
 
 				if !ok {
 					err := fmt.Errorf("channel shutdown")
-					files = recwatch.Event{Error: err}
+					files = &recwatch.Event{Error: err}
 					shutdown = true
 				}
 
@@ -425,7 +471,9 @@ func (obj *ExecRes) Watch(ctx context.Context) error {
 		}()
 	}
 
-	obj.init.Running() // when started, notify engine that we're running
+	if err := obj.init.Event(ctx); err != nil {
+		return err
+	}
 
 	for {
 		select {
@@ -469,19 +517,24 @@ func (obj *ExecRes) Watch(ctx context.Context) error {
 				continue
 			}
 
-		case files, ok := <-filesChan:
+		case event, ok := <-filesChan:
 			if !ok { // channel shutdown
 				return fmt.Errorf("unexpected recwatch shutdown")
 			}
-			if err := files.Error; err != nil {
+			if event == nil {
+				return fmt.Errorf("unexpected nil recwatch event")
+			}
+			if err := event.Error; err != nil {
 				return errwrap.Wrapf(err, "unknown %s watcher error", obj)
 			}
 
 		case <-ctx.Done(): // closed by the engine to signal shutdown
-			return nil
+			return ctx.Err()
 		}
 
-		obj.init.Event() // notify engine of an event (this can block)
+		if err := obj.init.Event(ctx); err != nil {
+			return err
+		}
 	}
 }
 
@@ -561,6 +614,7 @@ func (obj *ExecRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 			Setpgid: true,
 			Pgid:    0,
 		}
+		cmdSetupCancel(cmd)
 
 		// if we have an user and group, use them
 		var err error
@@ -616,6 +670,18 @@ func (obj *ExecRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 		}
 		if obj.IfEquals != nil && *obj.IfEquals == s {
 			obj.init.Logf("ifequals matched")
+			obj.safety()
+			if err := obj.send(); err != nil {
+				return false, err
+			}
+			return true, nil // don't run
+		}
+		if obj.IfEqualsStdout != nil && *obj.IfEqualsStdout == out.Stdout.String() {
+			obj.init.Logf("ifequals stdout matched")
+			obj.safety()
+			if err := obj.send(); err != nil {
+				return false, err
+			}
 			return true, nil // don't run
 		}
 	}
@@ -654,6 +720,7 @@ func (obj *ExecRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 			Setpgid: true,
 			Pgid:    0,
 		}
+		cmdSetupCancel(cmd)
 
 		// if we have an user and group, use them
 		var err error
@@ -770,13 +837,8 @@ func (obj *ExecRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 
 	wg := &sync.WaitGroup{}
 	defer wg.Wait() // this must be above the defer cancel() call
-	var innerCtx context.Context
-	var cancel context.CancelFunc
-	if obj.Timeout > 0 { // cmd.Process.Kill() is called on timeout
-		innerCtx, cancel = context.WithTimeout(ctx, time.Duration(obj.Timeout)*time.Second)
-	} else { // zero timeout means no timer
-		innerCtx, cancel = context.WithCancel(ctx)
-	}
+	// cmd.Process.Kill() is called on timeout
+	innerCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	cmd := exec.CommandContext(innerCtx, cmdName, cmdArgs...)
 	cmd.Dir = obj.Cwd // run program in pwd if ""
@@ -797,6 +859,7 @@ func (obj *ExecRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 		Setpgid: true,
 		Pgid:    0,
 	}
+	cmdSetupCancel(cmd)
 
 	// if we have a user and group, use them
 	var err error
@@ -846,6 +909,9 @@ func (obj *ExecRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 
 	// process the err result from cmd, we process non-zero exits here too!
 	exitErr, ok := err.(*exec.ExitError) // embeds an os.ProcessState
+	if err == context.DeadlineExceeded {
+		return false, err
+	}
 	if err != nil && ok {
 		pStateSys := exitErr.Sys() // (*os.ProcessState) Sys
 		wStatus, ok := pStateSys.(syscall.WaitStatus)
@@ -853,6 +919,7 @@ func (obj *ExecRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 			return false, errwrap.Wrapf(err, "error running cmd")
 		}
 		exitStatus := wStatus.ExitStatus()
+		//nolint:misspell // golang stdlib name (Signaled)
 		if !wStatus.Signaled() { // not a timeout or cancel (no signal)
 			// most commands error in this way
 			if s := out.String(); s == "" {
@@ -867,12 +934,17 @@ func (obj *ExecRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 
 		// we get this on timeout, because ctx calls cmd.Process.Kill()
 		if sig == syscall.SIGKILL {
+			// Don't do this, since we may wish to know how it died.
+			//if innerCtx.Err() == context.DeadlineExceeded {
+			//	return false, context.DeadlineExceeded
+			//}
 			return false, errwrap.Wrapf(err, "cmd timeout, exit status: %d", exitStatus)
 		}
 
 		return false, errwrap.Wrapf(err, "unknown cmd error, signal: %s, exit status: %d", sig, exitStatus)
 
-	} else if err != nil {
+	}
+	if err != nil {
 		return false, errwrap.Wrapf(err, "general cmd error")
 	}
 
@@ -920,6 +992,7 @@ func (obj *ExecRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 			Setpgid: true,
 			Pgid:    0,
 		}
+		cmdSetupCancel(cmd)
 
 		// if we have an user and group, use them
 		var err error
@@ -1092,9 +1165,6 @@ func (obj *ExecRes) Cmp(r engine.Res) error {
 	if obj.Shell != res.Shell {
 		return fmt.Errorf("the Shell differs")
 	}
-	if obj.Timeout != res.Timeout {
-		return fmt.Errorf("the Timeout differs")
-	}
 
 	if obj.WatchCmd != res.WatchCmd {
 		return fmt.Errorf("the WatchCmd differs")
@@ -1120,6 +1190,9 @@ func (obj *ExecRes) Cmp(r engine.Res) error {
 	}
 	if err := engineUtil.StrPtrCmp(obj.IfEquals, res.IfEquals); err != nil {
 		return errwrap.Wrapf(err, "the IfEquals differs")
+	}
+	if err := engineUtil.StrPtrCmp(obj.IfEqualsStdout, res.IfEqualsStdout); err != nil {
+		return errwrap.Wrapf(err, "the IfEqualsStdout differs")
 	}
 
 	if obj.NIfCmd != res.NIfCmd {
@@ -1215,7 +1288,7 @@ func (obj *ExecResAutoEdges) Test(input []bool) bool {
 }
 
 // AutoEdges returns the AutoEdge interface. In this case the systemd units.
-func (obj *ExecRes) AutoEdges() (engine.AutoEdge, error) {
+func (obj *ExecRes) AutoEdges(ctx context.Context) (engine.AutoEdge, error) {
 	var data []engine.ResUID
 	var reversed = true
 
@@ -1321,32 +1394,53 @@ func (obj *ExecRes) UnmarshalYAML(unmarshal func(interface{}) error) error {
 // getCredential returns the correct *syscall.Credential if an User and Group
 // are set.
 func (obj *ExecRes) getCredential() (*syscall.Credential, error) {
-	var uid, gid int
-	var err error
-	var currentUser *user.User
-	if currentUser, err = user.Current(); err != nil {
-		return nil, errwrap.Wrapf(err, "error looking up current user")
-	}
-	if currentUser.Uid != "0" {
-		// since we're not root, we've got nothing to do
+	if obj.User == "" && obj.Group == "" {
 		return nil, nil
 	}
 
-	if obj.Group != "" {
-		gid, err = engineUtil.GetGID(obj.Group)
-		if err != nil {
-			return nil, errwrap.Wrapf(err, "error looking up gid for %s", obj.Group)
-		}
+	currentUser, err := user.Current()
+	if err != nil {
+		return nil, errwrap.Wrapf(err, "error looking up current user")
 	}
 
+	uid, err := strconv.Atoi(currentUser.Uid)
+	if err != nil {
+		return nil, errwrap.Wrapf(err, "error casting current UID to int")
+	}
+	gid, err := strconv.Atoi(currentUser.Gid)
+	if err != nil {
+		return nil, errwrap.Wrapf(err, "error casting current GID to int")
+	}
+
+	wantedUID := uid
 	if obj.User != "" {
-		uid, err = engineUtil.GetUID(obj.User)
+		wantedUID, err = engineUtil.GetUID(obj.User)
 		if err != nil {
 			return nil, errwrap.Wrapf(err, "error looking up uid for %s", obj.User)
 		}
 	}
 
-	return &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)}, nil
+	wantedGID := gid
+	if obj.Group != "" {
+		wantedGID, err = engineUtil.GetGID(obj.Group)
+		if err != nil {
+			return nil, errwrap.Wrapf(err, "error looking up gid for %s", obj.Group)
+		}
+	}
+
+	// We are already are what we want, so no need to build the credentials.
+	if wantedUID == uid && wantedGID == gid {
+		return nil, nil
+	}
+
+	if uid != 0 { // XXX: add `&& gid != 0` or not?
+		// Since we're not root, we've got to error, but this should be
+		// caught in Validate first anyways.
+		return nil, fmt.Errorf("running as root is required if you want to use exec with a different user/group")
+	}
+
+	//nolint:gosec // G115: uid/gid values resolved from the system are non-negative
+	return &syscall.Credential{Uid: uint32(wantedUID), Gid: uint32(wantedGID)}, nil
 }
 
 // cmdFiles returns all the potential files/commands this command might need.
@@ -1393,7 +1487,10 @@ type cmdOutput struct {
 // it can't start up the command, it will fail early. Once it's running, it will
 // return the channel which can be used for the duration of the process.
 // Cancelling the context merely unblocks the sending on the output channel, it
-// does not Kill the cmd process. For that you must do it yourself elsewhere.
+// does not Kill the cmd process. For that you must do it yourself elsewhere. It
+// always reaps the process before the wg is done, so as to never leave a zombie
+// behind, but keep in mind that reaping blocks until the process exits, so
+// whoever kills it must not wait on the wg before doing the killing.
 func (obj *ExecRes) cmdOutputRunner(ctx context.Context, cmd *exec.Cmd) (chan *cmdOutput, error) {
 	stdoutReader, err := cmd.StdoutPipe()
 	if err != nil {
@@ -1416,6 +1513,14 @@ func (obj *ExecRes) cmdOutputRunner(ctx context.Context, cmd *exec.Cmd) (chan *c
 	go func() {
 		defer obj.wg.Done()
 		defer close(ch)
+		waited := false
+		defer func() {
+			if waited {
+				return
+			}
+			// always reap so we don't leave a zombie
+			_ = cmd.Wait()
+		}()
 		for scanner.Scan() {
 			select {
 			case ch <- &cmdOutput{text: scanner.Text()}: // blocks here ?
@@ -1426,6 +1531,7 @@ func (obj *ExecRes) cmdOutputRunner(ctx context.Context, cmd *exec.Cmd) (chan *c
 
 		// on EOF, scanner.Err() will be nil
 		reterr := scanner.Err()
+		waited = true
 		reterr = errwrap.Append(reterr, cmd.Wait()) // always run Wait()
 		// send any misc errors we encounter on the channel
 		if reterr != nil {
@@ -1505,6 +1611,24 @@ func (obj *wrapWriter) Write(p []byte) (int, error) {
 // String returns the contents of the unshared buffer.
 func (obj *wrapWriter) String() string {
 	return obj.Buffer.String()
+}
+
+// cmdSetupCancel configures cmd so that cancelling its context kills the entire
+// process group, instead of only the direct child process. Since we run
+// commands with Setpgid, a shell child would otherwise leave orphaned
+// grandchildren behind when killed. It also sets a WaitDelay so that Wait can't
+// block forever on I/O that some grandchild might hold open. This must be
+// called before the command is started.
+func cmdSetupCancel(cmd *exec.Cmd) {
+	cmd.Cancel = func() error {
+		// The negative pid signals the whole process group instead.
+		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		if err == syscall.ESRCH { // it's already dead
+			return os.ErrProcessDone // tells os/exec to ignore this
+		}
+		return err
+	}
+	cmd.WaitDelay = execCmdWaitDelay
 }
 
 // isNameValid checks that environment variable name is valid.

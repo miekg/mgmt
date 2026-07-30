@@ -100,12 +100,18 @@ func TestPrint1(t *testing.T) {
 	testCases[d0] = `{}`
 
 	d1 := NewMap(NewType("map{str: int}"))
-	d1.Set(&StrValue{V: "answer"}, &IntValue{V: 42})
+	if err := d1.Set(&StrValue{V: "answer"}, &IntValue{V: 42}); err != nil {
+		t.Fatalf("func Set: %v", err)
+	}
 	testCases[d1] = `{"answer": 42}`
 
 	d2 := NewMap(NewType("map{str: int}"))
-	d2.Set(&StrValue{V: "answer"}, &IntValue{V: 42})
-	d2.Set(&StrValue{V: "hello"}, &IntValue{V: 13})
+	if err := d2.Set(&StrValue{V: "answer"}, &IntValue{V: 42}); err != nil {
+		t.Fatalf("func Set: %v", err)
+	}
+	if err := d2.Set(&StrValue{V: "hello"}, &IntValue{V: 13}); err != nil {
+		t.Fatalf("func Set: %v", err)
+	}
 	testCases[d2] = `{"answer": 42, "hello": 13}`
 
 	s0 := NewStruct(NewType("struct{}"))
@@ -215,7 +221,9 @@ func TestReflectValue1(t *testing.T) {
 	testCases[d0] = `map[]`
 
 	d1 := NewMap(NewType("map{str: int}"))
-	d1.Set(&StrValue{V: "answer"}, &IntValue{V: 42})
+	if err := d1.Set(&StrValue{V: "answer"}, &IntValue{V: 42}); err != nil {
+		t.Fatalf("func Set: %v", err)
+	}
 	testCases[d1] = `map[answer:42]`
 
 	// multiple key maps are tested below since they have multiple outputs
@@ -480,8 +488,12 @@ func TestSort1(t *testing.T) {
 
 func TestMapReflectValue1(t *testing.T) {
 	d := NewMap(NewType("map{str: int}"))
-	d.Set(&StrValue{V: "answer"}, &IntValue{V: 42})
-	d.Set(&StrValue{V: "hello"}, &IntValue{V: 13})
+	if err := d.Set(&StrValue{V: "answer"}, &IntValue{V: 42}); err != nil {
+		t.Fatalf("func Set: %v", err)
+	}
+	if err := d.Set(&StrValue{V: "hello"}, &IntValue{V: 13}); err != nil {
+		t.Fatalf("func Set: %v", err)
+	}
 	// both are valid, since map's aren't sorted
 	// imo, golang should at least sort these on display!
 	// TODO: https://github.com/golang/go/issues/21095
@@ -496,7 +508,9 @@ func TestMapReflectValue1(t *testing.T) {
 	}
 
 	d2 := NewMap(NewType("map{str: str}"))
-	d2.Set(&StrValue{V: "answer"}, &StrValue{V: "42 hello:13"})
+	if err := d2.Set(&StrValue{V: "answer"}, &StrValue{V: "42 hello:13"}); err != nil {
+		t.Fatalf("func Set: %v", err)
+	}
 	val2 := d2.Value()
 
 	if v1, v2 := fmt.Sprintf("%+v", val), fmt.Sprintf("%+v", val2); v1 == v2 {
@@ -839,10 +853,15 @@ func TestValueInto0(t *testing.T) {
 			value:     mustValue(int64(-12345)),
 			compare:   int64(-12345),
 		},
-		{
+		{ // MaxInt64 is the largest value representable by an mcl int
 			container: &u,
-			value:     mustValue(uint64(math.MaxUint64)),
-			compare:   uint64(math.MaxUint64),
+			value:     mustValue(uint64(math.MaxInt64)),
+			compare:   uint64(math.MaxInt64),
+		},
+		{ // a negative mcl int can't be stored in an unsigned field
+			container: &u,
+			value:     &IntValue{V: -1},
+			shouldErr: true,
 		},
 		{ // ensure -1 from an int64 fits into an int8
 			container: &i8,
@@ -984,7 +1003,6 @@ func TestValueInto0(t *testing.T) {
 	for index, tc := range testCases {
 		name := fmt.Sprintf("test Into() %s #%d", reflect.TypeOf(tc.container).Elem(), index)
 		// https://github.com/purpleidea/mgmt/pull/629/files#r568305689
-		tc := tc
 		t.Run(name, func(t *testing.T) {
 			rvo := reflect.ValueOf(tc.container)
 
@@ -1064,7 +1082,6 @@ func TestValueInto1(t *testing.T) {
 	for index, tc := range testCases {
 		name := fmt.Sprintf("test Into() %s #%d", reflect.TypeOf(tc.container).Elem(), index)
 
-		tc := tc
 		t.Run(name, func(t *testing.T) {
 			ctrVal := reflect.ValueOf(tc.container)
 
@@ -1081,6 +1098,16 @@ func TestValueInto1(t *testing.T) {
 				return
 			}
 		})
+	}
+}
+
+// TestValueOfMaxUint64 is the old uint64(MaxUint64) Into() case. It used to
+// "round-trip" into a uint64 container, but mcl ints are int64, so MaxUint64
+// isn't even representable: it now fails to convert instead of bit-preserving
+// to -1 and silently wrapping back. (The failure is at ValueOf(), not Into().)
+func TestValueOfMaxUint64(t *testing.T) {
+	if _, err := ValueOfGolang(uint64(math.MaxUint64)); err == nil {
+		t.Errorf("function ValueOf() didn't return an error but one was expected")
 	}
 }
 

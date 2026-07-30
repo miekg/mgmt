@@ -35,6 +35,7 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"os/user"
 	"path"
 	"strings"
 	"syscall"
@@ -54,6 +55,9 @@ func fakeExecInit(t *testing.T) (*engine.Init, *ExecSends) {
 	}
 	execSends := &ExecSends{}
 	return &engine.Init{
+		Event: func(ctx context.Context) error {
+			return nil
+		},
 		Send: func(st interface{}) error {
 			x, ok := st.(*ExecSends)
 			if !ok {
@@ -68,6 +72,57 @@ func fakeExecInit(t *testing.T) (*engine.Init, *ExecSends) {
 		Debug: debug,
 		Logf:  logf,
 	}, execSends
+}
+
+func TestExecValidateCurrentUserGroup(t *testing.T) {
+	currentUser, err := user.Current()
+	if err != nil {
+		t.Fatalf("error looking up current user: %+v", err)
+	}
+
+	testCases := []struct {
+		name  string
+		user  string
+		group string
+	}{
+		{
+			name: "current user by name",
+			user: currentUser.Username,
+		},
+		{
+			name: "current user by uid",
+			user: currentUser.Uid,
+		},
+		{
+			name:  "current group by gid",
+			group: currentUser.Gid,
+		},
+		{
+			name:  "current user and group",
+			user:  currentUser.Uid,
+			group: currentUser.Gid,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			obj := &ExecRes{
+				Cmd:   "true",
+				User:  tc.user,
+				Group: tc.group,
+			}
+			if err := obj.Validate(); err != nil {
+				t.Errorf("validate failed with: %+v", err)
+			}
+			cred, err := obj.getCredential()
+			if err != nil {
+				t.Errorf("getCredential failed with: %+v", err)
+			}
+			if cred != nil {
+				t.Errorf("got unexpected credential: %+v", cred)
+			}
+		})
+	}
 }
 
 func TestExecSendRecv1(t *testing.T) {
@@ -424,7 +479,7 @@ func TestExecTimeoutBehaviour(t *testing.T) {
 			t.Errorf("error running cmd")
 			return
 		}
-		if !wStatus.Signaled() {
+		if !wStatus.Signaled() { //nolint:misspell // golang stdlib name
 			t.Errorf("did not get signal, exit status: %d", wStatus.ExitStatus())
 			return
 		}
@@ -487,7 +542,7 @@ func TestExecAutoEdge1(t *testing.T) {
 	logf := func(format string, v ...interface{}) {
 		t.Logf("test: "+format, v...)
 	}
-	if err := autoedge.AutoEdge(g, debug, logf); err != nil {
+	if err := autoedge.AutoEdge(context.TODO(), g, debug, logf); err != nil {
 		t.Errorf("error running autoedges: %v", err)
 		return
 	}

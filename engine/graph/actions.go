@@ -84,6 +84,12 @@ func (obj *Engine) BadTimestamps(vertex pgraph.Vertex) []pgraph.Vertex {
 	return vs // formerly "true" if empty
 }
 
+// errWatchRestart is the sentinel which the Watch retry loop hands to the
+// process loop when Watch failed and is about to restart. Receiving it (which
+// can only happen when no Process is running) withdraws the started state until
+// the replacement Watch sends its initial startup event.
+var errWatchRestart = engine.Error("watch restart")
+
 // Process is the primary function to execute a particular vertex in the graph.
 func (obj *Engine) Process(ctx context.Context, vertex pgraph.Vertex) error {
 	res, isRes := vertex.(engine.Res)
@@ -391,7 +397,7 @@ func (obj *Engine) Process(ctx context.Context, vertex pgraph.Vertex) error {
 		wg.Wait()
 	}
 
-	return errwrap.Wrapf(err, "error during Process()")
+	return err
 }
 
 // Worker is the common run frontend of the vertex. It handles all of the retry
@@ -481,6 +487,7 @@ func (obj *Engine) Worker(vertex pgraph.Vertex) error {
 			if delay > 0 {
 				errDelayExpired := engine.Error("delay exit")
 				err = func() error { // slim watch main loop
+					//nolint:gosec // G115: delay is trusted operator config in ms; only wraps above 2^63
 					timer := time.NewTimer(time.Duration(delay) * time.Millisecond)
 					defer state.init.Logf("the Watch delay expired!")
 					defer timer.Stop() // it's nice to cleanup
@@ -513,6 +520,11 @@ func (obj *Engine) Worker(vertex pgraph.Vertex) error {
 				err = state.poll(state.doneCtx, interval)
 				state.cuid.StopTimer() // clean up nicely
 
+			} else if interval := res.MetaParams().Poll; interval < 0 { // run once instead of watching
+				state.cuid.StartTimer()
+				err = state.once(state.doneCtx)
+				state.cuid.StopTimer() // clean up nicely
+
 			} else {
 				state.cuid.StartTimer()
 				if obj.Debug {
@@ -535,6 +547,21 @@ func (obj *Engine) Worker(vertex pgraph.Vertex) error {
 			}
 			// we've got an error...
 			delay = res.MetaParams().Delay
+
+			// A failed Watch must never overlap with a running
+			// Process, and no new Process may run until our
+			// replacement Watch sends its initial startup event.
+			// Interrupt any running Process, and then synchronize
+			// with the process loop through this sentinel, which it
+			// can only consume when no Process is running.
+			state.interruptProcess() // cancel any running Process
+			if retry != 0 {          // we're going to retry Watch
+				select {
+				case state.eventsChan <- errWatchRestart:
+				case <-state.doneCtx.Done():
+					// we're shutting down instead
+				}
+			}
 
 			if retry < 0 { // infinite retries
 				continue
@@ -565,8 +592,23 @@ func (obj *Engine) Worker(vertex pgraph.Vertex) error {
 	limiter := rate.NewLimiter(res.MetaParams().Limit, res.MetaParams().Burst)
 	var reserv *rate.Reservation
 	var reterr error
-	var failed bool // has Process permanently failed?
-	var closed bool // has the resumeSignal channel closed?
+	var failed bool  // has Process permanently failed?
+	var closed bool  // has the resumeSignal channel closed?
+	var started bool // has Watch sent the initial startup event?
+
+	// Worker starts paused, so wait for resume signal before we CheckApply.
+	// (it's okay to let Watch run immediately)
+	select {
+	case _, ok := <-state.resumeSignal: // channel closes
+		if !ok {
+			closed = true
+		}
+
+		// XXX: Should we have an easy exit here? Or let it exit below?
+		//case <-state.doneCtx.Done():
+		//	return nil
+	}
+
 Loop:
 	for { // process loop
 		// This is the main select where things happen and where we exit
@@ -578,6 +620,15 @@ Loop:
 		case err, ok := <-state.eventsChan: // read from watch channel
 			if !ok {
 				return reterr // we only return when chan closes
+			}
+			if err == errWatchRestart {
+				// Watch failed and is restarting. It already
+				// interrupted any running Process, and since we
+				// only receive between Process invocations, it
+				// now knows that none is running. Require a new
+				// initial event before we run any new Process.
+				started = false
+				continue
 			}
 			// If the Watch method exits with an error, then this
 			// channel will get that error propagated to it, which
@@ -591,6 +642,12 @@ Loop:
 			if obj.Debug {
 				obj.Logf("event received")
 			}
+			// We mark the state dirty on receive, not on send,
+			// since no Process can be running right now, so this
+			// mark can't get clobbered by the completion of an
+			// earlier Process.
+			state.setDirty()
+			started = true                           // the resource is now running
 			reserv = limiter.ReserveN(time.Now(), 1) // one event
 			// reserv.OK() seems to always be true here!
 
@@ -645,6 +702,16 @@ Loop:
 			continue Loop
 		}
 
+		// We must never Process (and CheckApply) before the initial
+		// event from Watch tells us that the resource is started and
+		// ready. A poke from a neighbouring resource can arrive before
+		// that, and the resume signal passthrough can also get us here
+		// early. It's safe to skip both, since the guaranteed initial
+		// event always runs Process, which subsumes them.
+		if !started {
+			continue Loop
+		}
+
 		// limit delay
 		d := time.Duration(0)
 		if reserv != nil {
@@ -667,6 +734,10 @@ Loop:
 					if !ok {
 						return reterr // we only return when chan closes
 					}
+					if e == errWatchRestart {
+						started = false // wait for the new initial event
+						continue
+					}
 					if e != nil {
 						failed = true
 						close(state.limitDone)             // causes doneCtx to cancel
@@ -676,6 +747,7 @@ Loop:
 					if obj.Debug {
 						obj.Logf("event received in limit")
 					}
+					state.setDirty() // on receive, see the main select
 					// TODO: does this get added in properly?
 					limiter.ReserveN(time.Now(), 1) // one event
 
@@ -699,6 +771,9 @@ Loop:
 		}
 		// don't Process anymore if we've already failed or shutdown...
 		if failed || closed {
+			continue Loop
+		}
+		if !started { // a restarting Watch withdrew our readiness...
 			continue Loop
 		}
 		// end of limit delay
@@ -726,6 +801,10 @@ Loop:
 						if !ok {
 							return reterr // we only return when chan closes
 						}
+						if e == errWatchRestart {
+							started = false // wait for the new initial event
+							continue
+						}
 						if e != nil {
 							failed = true
 							close(state.retryDone)             // causes doneCtx to cancel
@@ -735,6 +814,7 @@ Loop:
 						if obj.Debug {
 							obj.Logf("event received in retry")
 						}
+						state.setDirty() // on receive, see the main select
 						// TODO: does this get added in properly?
 						limiter.ReserveN(time.Now(), 1) // one event
 
@@ -761,12 +841,22 @@ Loop:
 			if failed || closed {
 				continue Loop
 			}
+			if !started { // a restarting Watch withdrew our readiness...
+				continue Loop
+			}
 
 			if obj.Debug {
 				obj.Logf("Process(%s)", vertex)
 			}
 			backPoke := false
-			err = obj.Process(state.doneCtx, vertex)
+			// Run with a cancellable context, and register it, so
+			// that a failing Watch can interrupt us to restart.
+			processCtx, pCancel := context.WithCancel(state.doneCtx)
+			state.registerProcessCancel(pCancel)
+			err = obj.Process(processCtx, vertex)
+			state.registerProcessCancel(nil)
+			interrupted := processCtx.Err() != nil && state.doneCtx.Err() == nil
+			pCancel() // cleanup the context
 			if err == engine.ErrBackPoke {
 				backPoke = true
 				err = nil // for future code safety
@@ -781,6 +871,14 @@ Loop:
 				metas.CheckApplyRetry = res.MetaParams().Retry // lookup the retry value
 			}
 			if err == nil || backPoke {
+				break RetryLoop
+			}
+			if interrupted {
+				// A restarting Watch interrupted this Process.
+				// That is not a CheckApply failure, so it must
+				// not count against the retry limit. The first
+				// event from the replacement Watch re-runs it.
+				state.init.Logf("process interrupted for watch restart")
 				break RetryLoop
 			}
 			// we've got an error...
@@ -832,7 +930,42 @@ func safeCheckApply(ctx context.Context, res engine.Res, apply bool) (checkOK bo
 			err = fmt.Errorf("panic in CheckApply: %+v", r)
 		}
 	}()
-	return res.CheckApply(ctx, apply)
+
+	timeout := res.MetaParams().Timeout
+	if timeout == 0 {
+		return res.CheckApply(ctx, apply)
+	}
+
+	//nolint:gosec // G115: timeout is trusted operator config in ms; only wraps above 2^63
+	duration := time.Duration(timeout) * time.Millisecond
+	checkApplyCtx, cancel := context.WithTimeout(ctx, duration)
+	defer cancel()
+
+	// NOTE: We always pass through the same checkOK value below, because if
+	// a resource made a mistake and returned (true, err) and we didn't pass
+	// through the `true`, we'd be silently suppressing that resource bug...
+	checkOK, err = res.CheckApply(checkApplyCtx, apply)
+	if checkApplyCtx.Err() != context.DeadlineExceeded {
+		return checkOK, err // return normally (err may even be nil)
+	}
+	// Timeout expired, resource returned, but we didn't return
+	// DeadlineExceeded. This may be because the resource had a bug and
+	// didn't properly propagate the error by returning ctx.Err() or it may
+	// be because the last `<-ctx.Done()` check was earlier in the code and
+	// the resource passed it. This is not a bug as long as workloads aren't
+	// blocking for more than approximately 1,000ms.
+	if err == nil {
+		return checkOK, nil
+	}
+	if err == context.DeadlineExceeded { // It returned correctly! Nice...
+		return checkOK, fmt.Errorf("timeout after %.3f seconds", duration.Seconds())
+	}
+
+	// This resource timed out, but returned an error. We're not sure
+	// whether the timeout caused the error, or if it errored and happened
+	// to timeout as well. Good resources return context.DeadlineExceeded,
+	// when that is the root cause. Patch those if that's not the case.
+	return checkOK, errwrap.Wrapf(err, "timeout after %.3f seconds", duration.Seconds())
 }
 
 // safeWatch wraps a call to res.Watch with a panic recovery so that a buggy

@@ -1,0 +1,30 @@
+-- main.mcl --
+import "golang"
+
+$v1 = struct{
+	a => "amazing",
+	b => 13,
+}
+$v2 = struct{
+	a => "idea",
+	b => 42,
+}
+
+$values = {
+	$v1 => "purple",
+	$v2 => "magic",
+}
+
+# Note that struct field names are accessed with upper case (Title-cased) chars.
+# This is consistent everywhere: struct values, list elements, function return
+# values, and (as here) struct map keys all use the same .Field form. Previously
+# this was inconsistent since *this* type of field accessing *can't* be lower,
+# but we can instead force everything else to upper.
+$tmpl = "{{ range $key, $val := . }}{{ $key.A }};{{ $key.B }};{{ $val }}{{ end }}"
+
+$out = golang.template($tmpl, $values)
+
+test [$out] {}
+
+-- OUTPUT --
+Vertex: test[amazing;13;purpleidea;42;magic]

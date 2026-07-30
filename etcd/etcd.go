@@ -138,19 +138,19 @@ import (
 )
 
 const (
-	// TODO: figure out a trailing slash convention...
+	// Root is the top-level path schema. In practice, when we use the lib,
+	// we typically tack on a "/_mgmt/" prefix.
+	Root = "/"
 
-	// ConvergedPath is the unprefixed path under which the converger
-	// may store data. This is public so that other consumers can know to
-	// avoid this key prefix.
-	ConvergedPath    = "/converged/"
-	convergedPathFmt = ConvergedPath + "%s" // takes a hostname on the end
+	// ConvergedPath is the unprefixed path under which the converger may
+	// store data. This is public so that other consumers can know to avoid
+	// this key prefix.
+	ConvergedPath = Root + "converged/"
 
-	// SchedulerPath is the unprefixed path under which the scheduler
-	// may store data. This is public so that other consumers can know to
-	// avoid this key prefix.
-	SchedulerPath    = "/scheduler/"
-	schedulerPathFmt = SchedulerPath + "%s" // takes a namespace on the end
+	// SchedulerPath is the unprefixed path under which the scheduler may
+	// store data. This is public so that other consumers can know to avoid
+	// this key prefix.
+	SchedulerPath = Root + "scheduler/"
 
 	// DefaultClientURL is the default value that is used for client URLs.
 	// It is pulled from the upstream etcd package.
@@ -169,16 +169,16 @@ const (
 	DefaultMaxTxnOps = 512
 
 	// ClientDialTimeout is the DialTimeout option in the client config.
-	ClientDialTimeout = 5 * time.Second
+	ClientDialTimeout = 15 * time.Second
 
 	// ClientDialKeepAliveTime is the DialKeepAliveTime config value for the
 	// etcd client. It is recommended that you use this so that dead
 	// endpoints don't block any cluster operations.
-	ClientDialKeepAliveTime = 2 * time.Second // from etcdctl
+	ClientDialKeepAliveTime = 10 * time.Second
 	// ClientDialKeepAliveTimeout is the DialKeepAliveTimeout config value
 	// for the etcd client. It is recommended that you use this so that dead
 	// endpoints don't block any cluster operations.
-	ClientDialKeepAliveTimeout = 6 * time.Second // from etcdctl
+	ClientDialKeepAliveTimeout = 20 * time.Second
 
 	// MemberChangeInterval is the polling interval to use when watching for
 	// member changes during add or remove.
@@ -189,9 +189,6 @@ const (
 	// This should be an integer multiple of seconds, since one second is
 	// the TTL precision used in etcd.
 	SessionTTL = 10 * time.Second // seconds
-
-	// ConvergerHostnameNamespace is a unique key used in the converger.
-	ConvergerHostnameNamespace = "etcd-hostname"
 )
 
 // EmbdEtcd provides the embedded server and client etcd functionality. The
@@ -221,8 +218,8 @@ type EmbdEtcd struct { // EMBeddeD etcd
 	// connections.
 	NoNetwork bool
 
-	// Converger is a converged coordinator object that can be used to
-	// track the converged state.
+	// Converger is a converged coordinator object that can be used to track
+	// the converged state.
 	Converger *converger.Coordinator
 
 	// NS is a string namespace that we prefix to every key operation.
@@ -394,7 +391,7 @@ func (obj *EmbdEtcd) Init() error {
 		}
 	}
 
-	if err := os.MkdirAll(obj.Prefix, 0770); err != nil {
+	if err := os.MkdirAll(obj.Prefix, 0750); err != nil {
 		return errwrap.Wrapf(err, "couldn't mkdir: %s", obj.Prefix)
 	}
 

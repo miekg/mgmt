@@ -116,6 +116,10 @@ func (obj *Svc) Run(ctx context.Context) error {
 			argv = append(argv, fmt.Sprintf("--ssh-hostkey=%s", s))
 		}
 
+		if s := obj.SetupSvcArgs.SSHID; s != "" {
+			argv = append(argv, fmt.Sprintf("--ssh-id=%s", s))
+		}
+
 		for _, seed := range obj.SetupSvcArgs.Seeds {
 			// TODO: validate each seed?
 			s := fmt.Sprintf("--seeds=%s", seed)
@@ -123,6 +127,7 @@ func (obj *Svc) Run(ctx context.Context) error {
 		}
 
 		argv = append(argv, "--no-autoedges") // XXX: not yet fast...
+		argv = append(argv, "--no-autogroup") // XXX: not yet fast...
 		argv = append(argv, "--no-pgp")       // XXX: not yet used...
 
 		argv = append(argv, "empty $OPTS")
@@ -143,6 +148,7 @@ func (obj *Svc) Run(ctx context.Context) error {
 		}
 		unitPath := "/etc/systemd/system/mgmt.service"
 
+		//nolint:gosec // G306: systemd unit files are world-readable by convention
 		if err := os.WriteFile(unitPath, []byte(unitData), 0644); err != nil {
 			return err
 		}

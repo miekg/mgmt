@@ -87,7 +87,7 @@ type Scaffold struct {
 
 	// D is the documentation handle for this function. We look on that
 	// struct or function for the doc string instead of the F field if this
-	// is specified. (This is used for facts.)
+	// is specified.
 	D interface{}
 }
 
@@ -182,6 +182,8 @@ var _ interfaces.BuildableFunc = &Func{} // ensure it meets this expectation
 // function API, but that can run a very simple, static, pure, polymorphic
 // function.
 type Func struct {
+	interfaces.Textarea
+
 	*docsUtil.Metadata
 	*WrappedFunc // *wrapped.Func as a type alias to pull in the base impl.
 
@@ -256,7 +258,7 @@ func StructRegister(moduleName string, args interface{}) error {
 	//fmt.Printf("A: %+v\n", args)
 
 	val := reflect.ValueOf(args)
-	if val.Kind() == reflect.Ptr { // max one de-referencing
+	if val.Kind() == reflect.Pointer { // max one de-referencing
 		val = val.Elem()
 	}
 	typ := val.Type()

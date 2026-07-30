@@ -139,7 +139,7 @@ const (
 // NetRes is a network interface resource based on netlink. It manages the state
 // of a network link. Configuration is also stored in a networkd configuration
 // file, so the network is available upon reboot. The name of the resource is
-// the string representing the network interface name. This could be "eth0" for
+// the string representing the network interface name. This could be "meth0" for
 // example. It supports flipping the state if you ask for it to be reversible.
 type NetRes struct {
 	traits.Base // add the base methods without re-implementation
@@ -162,7 +162,8 @@ type NetRes struct {
 	// IPForward is a boolean that sets whether we should forward incoming
 	// packets onward when this is set. It default to unspecified, which
 	// downstream (in the systemd-networkd configuration) defaults to false.
-	// XXX: this could also be "ipv4" or "ipv6", add those as a second option?
+	// XXX: this could also be "ipv4" or "ipv6", add those as a second
+	// option?
 	IPForward *bool `lang:"ip_forward" yaml:"ip_forward"`
 
 	iface        *iface // a struct containing the net.Interface and netlink.Link
@@ -307,6 +308,7 @@ func (obj *NetRes) Watch(ctx context.Context) error {
 				case <-closeChan:
 					return
 				}
+				continue
 			}
 			select {
 			case nlChan <- &nlChanStruct{
@@ -318,7 +320,9 @@ func (obj *NetRes) Watch(ctx context.Context) error {
 		}
 	}()
 
-	obj.init.Running() // when started, notify engine that we're running
+	if err := obj.init.Event(ctx); err != nil {
+		return err
+	}
 
 	var done bool
 	for {
@@ -326,7 +330,7 @@ func (obj *NetRes) Watch(ctx context.Context) error {
 		case s, ok := <-nlChan:
 			if !ok {
 				if done {
-					return nil
+					return ctx.Err()
 				}
 				done = true
 				continue
@@ -335,29 +339,35 @@ func (obj *NetRes) Watch(ctx context.Context) error {
 				return errwrap.Wrapf(s.err, "unknown netlink error")
 			}
 			if obj.init.Debug {
-				obj.init.Logf("Event: %+v", s.msg)
+				obj.init.Logf("event: %+v", s.msg)
 			}
 
 		case event, ok := <-recWatcher.Events():
 			if !ok {
 				if done {
-					return nil
+					return ctx.Err()
 				}
 				done = true
 				continue
+			}
+			if event == nil {
+				// programming error
+				return fmt.Errorf("unexpected nil recwatch event")
 			}
 			if err := event.Error; err != nil {
 				return errwrap.Wrapf(err, "unknown recwatcher error")
 			}
 			if obj.init.Debug {
-				obj.init.Logf("Event(%s): %v", event.Body.Name, event.Body.Op)
+				obj.init.Logf("event(%s): %v", event.Body.Name, event.Body.Op)
 			}
 
 		case <-ctx.Done(): // closed by the engine to signal shutdown
-			return nil
+			return ctx.Err()
 		}
 
-		obj.init.Event() // notify engine of an event (this can block)
+		if err := obj.init.Event(ctx); err != nil {
+			return err
+		}
 	}
 }
 

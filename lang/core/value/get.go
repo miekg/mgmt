@@ -43,7 +43,8 @@ const (
 	// GetFuncName is the name this function is registered as. This variant
 	// is the fanciest version, although type unification is much more
 	// difficult when using this.
-	// XXX: type unification doesn't work perfectly here yet... maybe a bug with returned structs?
+	// XXX: type unification doesn't work perfectly here yet... maybe a bug
+	// with returned structs?
 	GetFuncName = "get"
 
 	// GetBoolFuncName is the name this function is registered as. This
@@ -85,6 +86,8 @@ var _ interfaces.StreamableFunc = &GetFunc{}
 // of that type. It is instead recommended to use the Get* functions that are
 // more strictly typed.
 type GetFunc struct {
+	interfaces.Textarea
+
 	// Type is the actual type being used for the value we are looking up.
 	Type *types.Type
 
@@ -182,6 +185,8 @@ func (obj *GetFunc) Build(typ *types.Type) (*types.Type, error) {
 // function.
 func (obj *GetFunc) Copy() interfaces.Func {
 	return &GetFunc{
+		Textarea: obj.Textarea,
+
 		Type: obj.Type, // don't copy because we use this after unification
 
 		init: obj.init, // likely gets overwritten anyways

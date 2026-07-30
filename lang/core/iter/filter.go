@@ -67,6 +67,8 @@ var _ interfaces.BuildableFunc = &FilterFunc{} // ensure it meets this expectati
 // languages that support partial function application, the former variant that
 // we implemented is much more readable when using an inline lambda.
 type FilterFunc struct {
+	interfaces.Textarea
+
 	Type *types.Type // this is the type of the elements in our input list
 
 	init *interfaces.Init
@@ -248,6 +250,10 @@ func (obj *FilterFunc) replaceSubGraph(subgraphInput interfaces.Func) error {
 	//	"subgraphInput" -> "filterInputElem1"
 	//	"subgraphInput" -> "filterInputElem2"
 	//
+	//	"filter" -> "filterInputElem0"
+	//	"filter" -> "filterInputElem1"
+	//	"filter" -> "filterInputElem2"
+	//
 	//	"filterInputElem0" -> "outputElemFunc0"
 	//	"filterInputElem1" -> "outputElemFunc1"
 	//	"filterInputElem2" -> "outputElemFunc2"
@@ -280,6 +286,7 @@ func (obj *FilterFunc) replaceSubGraph(subgraphInput interfaces.Func) error {
 		return fmt.Sprintf("outputElem%d", i)
 	}
 	argNameInputList := "inputList"
+	argNameInputDummy := structs.OutputFuncDummyArgName
 
 	m := make(map[string]*types.Type)
 	ord := []string{}
@@ -330,13 +337,12 @@ func (obj *FilterFunc) replaceSubGraph(subgraphInput interfaces.Func) error {
 	obj.init.Txn.AddEdge(outputListFunc, obj.outputFunc, edge)
 
 	for i := 0; i < obj.lastInputListLength; i++ {
-		i := i
 		inputElemFunc := structs.SimpleFnToDirectFunc(
 			fmt.Sprintf("filterInputElem[%d]", i),
 			&types.FuncValue{
 				V: func(_ context.Context, args []types.Value) (types.Value, error) {
-					if len(args) != 1 {
-						return nil, fmt.Errorf("inputElemFunc: expected a single argument")
+					if len(args) != 2 {
+						return nil, fmt.Errorf("inputElemFunc: expected two arguments")
 					}
 					arg := args[0]
 
@@ -353,7 +359,7 @@ func (obj *FilterFunc) replaceSubGraph(subgraphInput interfaces.Func) error {
 					}
 					return valuesList[i], nil
 				},
-				T: types.NewType(fmt.Sprintf("func(%s %s) %s", argNameInputList, obj.listType, obj.Type)),
+				T: types.NewType(fmt.Sprintf("func(%s %s, %s nil) %s", argNameInputList, obj.listType, argNameInputDummy, obj.Type)),
 			},
 		)
 		obj.init.Txn.AddVertex(inputElemFunc)
@@ -365,6 +371,9 @@ func (obj *FilterFunc) replaceSubGraph(subgraphInput interfaces.Func) error {
 
 		obj.init.Txn.AddEdge(subgraphInput, inputElemFunc, &interfaces.FuncEdge{
 			Args: []string{argNameInputList},
+		})
+		obj.init.Txn.AddEdge(obj, inputElemFunc, &interfaces.FuncEdge{
+			Args: []string{argNameInputDummy},
 		})
 
 		combinerValueElem := fmt.Sprintf("combinerValueElem%d", i)
@@ -469,7 +478,9 @@ func (obj *FilterFunc) Call(ctx context.Context, args []types.Value) (types.Valu
 
 // Cleanup runs after that function was removed from the graph.
 func (obj *FilterFunc) Cleanup(ctx context.Context) error {
-	obj.init.Txn.Reverse()
+	if err := obj.init.Txn.Reverse(); err != nil {
+		return err
+	}
 	//obj.init.Txn.DeleteVertex(subgraphInput) // XXX: should we delete it?
 	return obj.init.Txn.Commit()
 }
@@ -478,6 +489,8 @@ func (obj *FilterFunc) Cleanup(ctx context.Context) error {
 // function.
 func (obj *FilterFunc) Copy() interfaces.Func {
 	return &FilterFunc{
+		Textarea: obj.Textarea,
+
 		Type: obj.Type, // don't copy because we use this after unification
 
 		init: obj.init, // likely gets overwritten anyways

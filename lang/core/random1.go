@@ -59,6 +59,8 @@ func init() {
 // Random1Func returns one random string of a certain length. If you change the
 // length, then it will produce a new random value.
 type Random1Func struct {
+	interfaces.Textarea
+
 	// XXX: To produce a stream of random values every N seconds, make a
 	// built-in function or use the dual <|> hack below?
 	// XXX: Maybe it should be returning a stream of floats [0,1] as well,
@@ -126,7 +128,7 @@ func generate(length uint16) (string, error) {
 		return "", fmt.Errorf("string is empty")
 	}
 
-	if uint16(len(output)) != length { // safety against weird bugs
+	if len(output) != int(length) { // safety against weird bugs
 		return "", fmt.Errorf("random string is too short") // bug!
 	}
 

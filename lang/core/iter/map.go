@@ -69,6 +69,8 @@ var _ interfaces.BuildableFunc = &MapFunc{} // ensure it meets this expectation
 // TODO: should we extend this to support iterating over map's and structs, or
 // should that be a different function? I think a different function is best.
 type MapFunc struct {
+	interfaces.Textarea
+
 	Type  *types.Type // this is the type of the elements in our input list
 	RType *types.Type // this is the type of the elements in our output list
 
@@ -254,6 +256,10 @@ func (obj *MapFunc) replaceSubGraph(subgraphInput interfaces.Func) error {
 	//	"subgraphInput" -> "inputElemFunc1"
 	//	"subgraphInput" -> "inputElemFunc2"
 	//
+	//	"map" -> "inputElemFunc0"
+	//	"map" -> "inputElemFunc1"
+	//	"map" -> "inputElemFunc2"
+	//
 	//	"inputElemFunc0" -> "outputElemFunc0"
 	//	"inputElemFunc1" -> "outputElemFunc1"
 	//	"inputElemFunc2" -> "outputElemFunc2"
@@ -273,6 +279,7 @@ func (obj *MapFunc) replaceSubGraph(subgraphInput interfaces.Func) error {
 	// create the new subgraph
 
 	argNameInputList := "inputList"
+	argNameInputDummy := structs.OutputFuncDummyArgName
 
 	m := make(map[string]*types.Type)
 	ord := []string{}
@@ -308,13 +315,12 @@ func (obj *MapFunc) replaceSubGraph(subgraphInput interfaces.Func) error {
 	obj.init.Txn.AddEdge(outputListFunc, obj.outputFunc, edge)
 
 	for i := 0; i < obj.lastInputListLength; i++ {
-		i := i
 		inputElemFunc := structs.SimpleFnToDirectFunc(
 			fmt.Sprintf("mapInputElem[%d]", i),
 			&types.FuncValue{
 				V: func(_ context.Context, args []types.Value) (types.Value, error) {
-					if len(args) != 1 {
-						return nil, fmt.Errorf("inputElemFunc: expected a single argument")
+					if len(args) != 2 {
+						return nil, fmt.Errorf("inputElemFunc: expected two arguments")
 					}
 					arg := args[0]
 
@@ -324,9 +330,13 @@ func (obj *MapFunc) replaceSubGraph(subgraphInput interfaces.Func) error {
 					}
 
 					// Extract the correct list element.
-					return list.List()[i], nil
+					valuesList := list.List()
+					if l := len(valuesList); i >= l {
+						return nil, fmt.Errorf("index %d out of range with length %d", i, l)
+					}
+					return valuesList[i], nil
 				},
-				T: types.NewType(fmt.Sprintf("func(%s %s) %s", argNameInputList, obj.inputListType, obj.Type)),
+				T: types.NewType(fmt.Sprintf("func(%s %s, %s nil) %s", argNameInputList, obj.inputListType, argNameInputDummy, obj.Type)),
 			},
 		)
 		obj.init.Txn.AddVertex(inputElemFunc)
@@ -338,6 +348,9 @@ func (obj *MapFunc) replaceSubGraph(subgraphInput interfaces.Func) error {
 
 		obj.init.Txn.AddEdge(subgraphInput, inputElemFunc, &interfaces.FuncEdge{
 			Args: []string{argNameInputList},
+		})
+		obj.init.Txn.AddEdge(obj, inputElemFunc, &interfaces.FuncEdge{
+			Args: []string{argNameInputDummy},
 		})
 		obj.init.Txn.AddEdge(outputElemFunc, outputListFunc, &interfaces.FuncEdge{
 			Args: []string{fmt.Sprintf("outputElem%d", i)},
@@ -410,7 +423,9 @@ func (obj *MapFunc) Call(ctx context.Context, args []types.Value) (types.Value, 
 
 // Cleanup runs after that function was removed from the graph.
 func (obj *MapFunc) Cleanup(ctx context.Context) error {
-	obj.init.Txn.Reverse()
+	if err := obj.init.Txn.Reverse(); err != nil {
+		return err
+	}
 	//obj.init.Txn.DeleteVertex(subgraphInput) // XXX: should we delete it?
 	return obj.init.Txn.Commit()
 }
@@ -419,6 +434,8 @@ func (obj *MapFunc) Cleanup(ctx context.Context) error {
 // function.
 func (obj *MapFunc) Copy() interfaces.Func {
 	return &MapFunc{
+		Textarea: obj.Textarea,
+
 		Type:  obj.Type,  // don't copy because we use this after unification
 		RType: obj.RType, // don't copy because we use this after unification
 

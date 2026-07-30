@@ -250,7 +250,10 @@ func (obj *GsettingsRes) makeComposite() (*ExecRes, error) {
 	//	"XDG_RUNTIME_DIR":          fmt.Sprintf("/run/user/%d/", uid),
 	//}
 
-	//exec.Timeout = ? // TODO: should we have a timeout to prevent blocking?
+	// TODO: should we have a timeout to prevent blocking?
+	//meta := engine.DefaultMetaParams.Copy()
+	//meta.Timeout = obj.MetaParams().Timeout
+	//exec.SetMetaParams(meta)
 
 	return exec, nil
 }
@@ -339,7 +342,9 @@ func (obj *GsettingsRes) Watch(ctx context.Context) error {
 	}
 	defer recWatcher.Close()
 
-	obj.init.Running() // when started, notify engine that we're running
+	if err := obj.init.Event(ctx); err != nil {
+		return err
+	}
 
 	for {
 		if obj.init.Debug {
@@ -351,6 +356,10 @@ func (obj *GsettingsRes) Watch(ctx context.Context) error {
 			if !ok { // channel shutdown
 				return nil
 			}
+			if event == nil {
+				// programming error
+				return fmt.Errorf("unexpected nil recwatch event")
+			}
 			if err := event.Error; err != nil {
 				return errwrap.Wrapf(err, "unknown %s watcher error", obj)
 			}
@@ -359,10 +368,12 @@ func (obj *GsettingsRes) Watch(ctx context.Context) error {
 			}
 
 		case <-ctx.Done(): // closed by the engine to signal shutdown
-			return nil
+			return ctx.Err()
 		}
 
-		obj.init.Event() // notify engine of an event (this can block)
+		if err := obj.init.Event(ctx); err != nil {
+			return err
+		}
 
 		if _, err := obj.uid(); err == nil {
 			break // we can watch normally now...

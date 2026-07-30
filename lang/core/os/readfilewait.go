@@ -61,6 +61,8 @@ func init() {
 // string. If the file re-appears, it returns those new contents. This function
 // will eventually be deprecated when the function graph error system is stable.
 type ReadFileWaitFunc struct {
+	interfaces.Textarea
+
 	init *interfaces.Init
 
 	recWatcher *recwatch.RecWatcher
@@ -118,7 +120,7 @@ func (obj *ReadFileWaitFunc) Stream(ctx context.Context) error {
 	defer wg.Wait()
 	defer func() {
 		if obj.recWatcher != nil {
-			obj.recWatcher.Close() // close previous watcher
+			_ = obj.recWatcher.Close() // close previous watcher
 			wg.Wait()
 		}
 	}()
@@ -144,7 +146,7 @@ func (obj *ReadFileWaitFunc) Stream(ctx context.Context) error {
 			obj.filename = &filename
 
 			if obj.recWatcher != nil {
-				obj.recWatcher.Close() // close previous watcher
+				_ = obj.recWatcher.Close() // close previous watcher
 				wg.Wait()
 			}
 			// create new watcher
@@ -183,6 +185,11 @@ func (obj *ReadFileWaitFunc) Stream(ctx context.Context) error {
 					case event, ok := <-obj.recWatcher.Events():
 						if !ok {
 							return // file watcher shut down
+						}
+						if event == nil {
+							// programming error
+							err = fmt.Errorf("unexpected nil recwatch event")
+							break
 						}
 						if err = event.Error; err != nil {
 							err = errwrap.Wrapf(err, "error event received")

@@ -41,17 +41,19 @@ import (
 
 	"github.com/purpleidea/mgmt/engine"
 	"github.com/purpleidea/mgmt/engine/traits"
+	"github.com/purpleidea/mgmt/util/errwrap"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/filters"
 	dockerImage "github.com/docker/docker/api/types/image"
 	dockerClient "github.com/docker/docker/client"
-	errwrap "github.com/pkg/errors"
 )
 
 func init() {
 	engine.RegisterResource("docker:image", func() engine.Res { return &DockerImageRes{} })
 }
+
+var _ engine.EdgeableRes = &DockerImageRes{} // compile time check
 
 // DockerImageRes is a docker image resource. The resource's name must be a
 // docker image in any supported format (url, image, or image:tag).
@@ -145,7 +147,9 @@ func (obj *DockerImageRes) Watch(ctx context.Context) error {
 		if dockerClient.IsErrConnectionFailed(err) && !obj.sflag {
 			// notify engine that we're running so that CheckApply
 			// can start...
-			obj.init.Running()
+			if err := obj.init.Event(ctx); err != nil {
+				return err
+			}
 			select {
 			case <-obj.start:
 				obj.sflag = true
@@ -166,7 +170,9 @@ func (obj *DockerImageRes) Watch(ctx context.Context) error {
 
 	// notify engine that we're running
 	if !obj.sflag {
-		obj.init.Running()
+		if err := obj.init.Event(ctx); err != nil {
+			return err
+		}
 	}
 
 	for {
@@ -186,10 +192,12 @@ func (obj *DockerImageRes) Watch(ctx context.Context) error {
 			return err
 
 		case <-ctx.Done(): // closed by the engine to signal shutdown
-			return nil
+			return ctx.Err()
 		}
 
-		obj.init.Event() // notify engine of an event (this can block)
+		if err := obj.init.Event(ctx); err != nil {
+			return err
+		}
 	}
 }
 
@@ -302,7 +310,7 @@ func (obj *DockerImageRes) UIDs() []engine.ResUID {
 }
 
 // AutoEdges returns the AutoEdge interface.
-func (obj *DockerImageRes) AutoEdges() (engine.AutoEdge, error) {
+func (obj *DockerImageRes) AutoEdges(ctx context.Context) (engine.AutoEdge, error) {
 	return nil, nil
 }
 

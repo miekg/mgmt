@@ -29,8 +29,49 @@
 
 package util
 
+import (
+	"errors"
+	"strconv"
+)
+
 // Error is a constant error type that implements error.
 type Error string
 
 // Error fulfills the error interface of this type.
-func (e Error) Error() string { return string(e) }
+func (obj Error) Error() string { return string(obj) }
+
+// ExitCodeError is an error that carries a process exit code.
+type ExitCodeError struct {
+	Code int
+}
+
+// Error fulfills the error interface of this type.
+func (obj ExitCodeError) Error() string {
+	return "exit " + strconv.Itoa(obj.Code)
+}
+
+// ExitCode returns the process exit code.
+func (obj ExitCodeError) ExitCode() int {
+	return obj.Code
+}
+
+// ExitCode returns a process exit code from an error chain. If the error is nil
+// it returns 0. If it has an embedded code, it returns that, otherwise it
+// returns 1.
+func ExitCode(err error) int {
+	if err == nil {
+		return 0
+	}
+
+	// TODO: can we do this without defining this interface?
+	type exitCoder interface {
+		ExitCode() int
+	}
+
+	var exitErr exitCoder
+	if errors.As(err, &exitErr) {
+		return exitErr.ExitCode()
+	}
+
+	return 1 // some uncoded error
+}

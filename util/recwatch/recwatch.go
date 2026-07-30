@@ -32,7 +32,6 @@ package recwatch
 
 import (
 	"fmt"
-	"math"
 	"os"
 	"path"
 	"path/filepath"
@@ -68,9 +67,9 @@ type RecWatcher struct {
 	safename string           // safe path
 	watcher  *fsnotify.Watcher
 	watches  map[string]struct{}
-	events   chan Event // one channel for events and err...
-	closed   bool       // is the events channel closed?
-	mutex    sync.Mutex // lock guarding the channel closing
+	events   chan *Event // one channel for events and err...
+	closed   bool        // is the events channel closed?
+	mutex    sync.Mutex  // lock guarding the channel closing
 	wg       sync.WaitGroup
 	exit     chan struct{}
 }
@@ -89,7 +88,7 @@ func NewRecWatcher(path string, recurse bool, opts ...Option) (*RecWatcher, erro
 func (obj *RecWatcher) Init() error {
 	obj.watcher = nil
 	obj.watches = make(map[string]struct{})
-	obj.events = make(chan Event)
+	obj.events = make(chan *Event)
 	obj.exit = make(chan struct{})
 	obj.isDir = strings.HasSuffix(obj.Path, "/") // dirs have trailing slashes
 	obj.safename = path.Clean(obj.Path)          // no trailing slash
@@ -128,8 +127,7 @@ func (obj *RecWatcher) Init() error {
 			obj.mutex.Lock()
 			if !obj.closed {
 				select {
-				// TODO: &Event instead?
-				case obj.events <- Event{Error: err}:
+				case obj.events <- &Event{Error: err}:
 				case <-obj.exit:
 					// pass
 				}
@@ -165,9 +163,10 @@ func (obj *RecWatcher) Close() error {
 }
 
 // Events returns a channel of events. These include events for errors.
-func (obj *RecWatcher) Events() chan Event { return obj.events }
+func (obj *RecWatcher) Events() chan *Event { return obj.events }
 
 // Watch is the primary listener for this resource and it outputs events.
+// XXX: This should take a ctx instead of using Close()?
 func (obj *RecWatcher) Watch() error {
 	if obj.watcher == nil {
 		return fmt.Errorf("the watcher is not initialized")
@@ -178,8 +177,12 @@ func (obj *RecWatcher) Watch() error {
 	var current string                        // current "watcher" location
 	var deltaDepth int                        // depth delta between watcher and event
 	var send = false                          // send event?
+	var body *fsnotify.Event
 
 	for {
+		if index < 1 || index > len(patharray) {
+			return fmt.Errorf("recwatch: invalid path index %d for %q", index, obj.safename)
+		}
 		current = strings.Join(patharray[0:index], "/")
 		if current == "" { // the empty string top is the root dir ("/")
 			current = "/"
@@ -194,8 +197,9 @@ func (obj *RecWatcher) Watch() error {
 			}
 			// ENOENT for linux, etc and IsNotExist for macOS
 			if err == syscall.ENOENT || os.IsNotExist(err) {
-				index-- // usually not found, move up one dir
-				index = int(math.Max(1, float64(index)))
+				if index > 1 {
+					index-- // usually not found, move up one dir
+				}
 				continue
 			}
 
@@ -204,14 +208,26 @@ func (obj *RecWatcher) Watch() error {
 				// TODO: consider letting the user fall back to
 				// polling if they hit this error very often...
 				return fmt.Errorf("out of inotify watches: %v", err)
-			} else if os.IsPermission(err) {
+			}
+
+			if os.IsPermission(err) {
 				return fmt.Errorf("permission denied adding a watch: %v", err)
 			}
+
 			return fmt.Errorf("unknown error: %v", err)
 		}
 
 		select {
-		case event := <-obj.watcher.Events:
+		case event, ok := <-obj.watcher.Events:
+			if !ok {
+				// TODO: return a future ctx.Err() instead?
+				return fmt.Errorf("unexpected nil watcher events shutdown")
+			}
+			//if event == nil { // not possible
+			//	return fmt.Errorf("unexpected nil watcher event")
+			//}
+			body = &event // what body to send?
+
 			if obj.options.debug {
 				obj.options.logf("watch(%s), event(%s): %v", current, event.Name, event.Op)
 			}
@@ -230,11 +246,13 @@ func (obj *RecWatcher) Watch() error {
 				if _, exists := obj.watches[event.Name]; exists {
 					send = true
 					if event.Op&fsnotify.Remove == fsnotify.Remove {
-						obj.watcher.Remove(event.Name)
+						// best-effort: the watch may already be gone
+						_ = obj.watcher.Remove(event.Name)
 						delete(obj.watches, event.Name)
 					}
 					if (event.Op&fsnotify.Create == fsnotify.Create) && isDir(event.Name) {
-						obj.watcher.Add(event.Name)
+						// best-effort: re-add on the next event if this fails
+						_ = obj.watcher.Add(event.Name)
 						obj.watches[event.Name] = struct{}{}
 						if err := obj.addSubFolders(event.Name); err != nil {
 							return err
@@ -265,33 +283,46 @@ func (obj *RecWatcher) Watch() error {
 
 				// file removed, move the watch upwards
 				if deltaDepth >= 0 && (event.Op&fsnotify.Remove == fsnotify.Remove) {
-					//obj.options.logf("removal!")
-					obj.watcher.Remove(current)
-					index--
+					if index > 1 {
+						//obj.options.logf("removal!")
+						// best-effort: the watch may already be gone
+						_ = obj.watcher.Remove(current)
+						index--
+					}
 				}
 
 				// when the file is moved, remove the watcher and add a new one,
 				// so we stop tracking the old inode.
 				if deltaDepth >= 0 && (event.Op&fsnotify.Rename == fsnotify.Rename) {
-					obj.watcher.Remove(current)
-					obj.watcher.Add(current)
+					// best-effort: re-establish the watch on the new inode
+					_ = obj.watcher.Remove(current)
+					_ = obj.watcher.Add(current)
 				}
 
 				// we must be a parent watcher, so descend in
 				if deltaDepth < 0 {
-					// XXX: we can block here due to: https://github.com/fsnotify/fsnotify/issues/123
-					obj.watcher.Remove(current)
-					index++
+					if index < len(patharray) {
+						// XXX: we can block here due to: https://github.com/fsnotify/fsnotify/issues/123
+						// best-effort: the watch may already be gone
+						_ = obj.watcher.Remove(current)
+						index++
+					}
 				}
 
-				// if safename starts with event.Name, we're above, and no event should be sent
-			} else if util.HasPathPrefix(obj.safename, event.Name) {
+				goto Send
+			}
+
+			// if safename starts with event.Name, we're above, and no event should be sent
+			if util.HasPathPrefix(obj.safename, event.Name) {
 				//obj.options.logf("above!")
 
 				if deltaDepth >= 0 && (event.Op&fsnotify.Remove == fsnotify.Remove) {
-					//obj.options.logf("removal!")
-					obj.watcher.Remove(current)
-					index--
+					if index > 1 {
+						//obj.options.logf("removal!")
+						// best-effort: the watch may already be gone
+						_ = obj.watcher.Remove(current)
+						index--
+					}
 				}
 
 				if deltaDepth < 0 {
@@ -299,34 +330,51 @@ func (obj *RecWatcher) Watch() error {
 					if util.PathPrefixDelta(obj.safename, event.Name) == 1 { // we're the parent dir
 						send = true
 					}
-					obj.watcher.Remove(current)
-					index++
+					if index < len(patharray) {
+						// XXX: we can block here due to: https://github.com/fsnotify/fsnotify/issues/123
+						// best-effort: the watch may already be gone
+						_ = obj.watcher.Remove(current)
+						index++
+					}
 				}
 
-				// if event.Name startswith safename, send event, we're already deeper
-			} else if util.HasPathPrefix(event.Name, obj.safename) {
+				goto Send
+			}
+
+			// if event.Name startswith safename, send event, we're already deeper
+			if util.HasPathPrefix(event.Name, obj.safename) {
 				//obj.options.logf("event2!")
 				send = true
+				goto Send
 			}
 
-			// do all our event sending all together to avoid duplicate msgs
-			if send {
-				send = false
-				// only invalid state on certain types of events
-				select {
-				// exit even when we're blocked on event sending
-				// TODO: &Event instead?
-				case obj.events <- Event{Error: nil, Body: &event}:
-				case <-obj.exit:
-					return fmt.Errorf("pending event not sent")
-				}
+		case err, ok := <-obj.watcher.Errors:
+			if !ok {
+				// TODO: return a future ctx.Err() instead?
+				return fmt.Errorf("unexpected nil watcher error shutdown")
+			}
+			if err == nil {
+				// TODO: can this even happen?
+				return fmt.Errorf("unexpected nil watcher error")
 			}
 
-		case err := <-obj.watcher.Errors:
 			return fmt.Errorf("unknown watcher error: %v", err)
 
 		case <-obj.exit:
 			return nil
+		}
+
+	Send:
+		// do all our event sending all together to avoid duplicate msgs
+		if send {
+			send = false
+			// only invalid state on certain types of events
+			select {
+			// exit even when we're blocked on event sending
+			case obj.events <- &Event{Body: body}:
+			case <-obj.exit:
+				return fmt.Errorf("pending event not sent")
+			}
 		}
 	}
 }
@@ -391,13 +439,13 @@ func isDir(path string) bool {
 // MergeChannels is a helper function to combine different recwatch events. It
 // would be preferable to actually fix the horrible recwatch code to allow it to
 // monitor more than one path from the start.
-func MergeChannels(chanList ...<-chan Event) <-chan Event {
-	out := make(chan Event)
+func MergeChannels(chanList ...<-chan *Event) <-chan *Event {
+	out := make(chan *Event)
 	wg := &sync.WaitGroup{}
 	wg.Add(len(chanList)) // do them all together
 	for _, ch := range chanList {
 		//wg.Add(1)
-		go func(ch <-chan Event) {
+		go func(ch <-chan *Event) {
 			defer wg.Done()
 			for v := range ch {
 				out <- v

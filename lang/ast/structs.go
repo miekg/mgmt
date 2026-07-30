@@ -35,6 +35,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"math"
 	"reflect"
 	"sort"
 	"strconv"
@@ -201,7 +202,7 @@ type StmtBind struct {
 
 // String returns a short representation of this statement.
 func (obj *StmtBind) String() string {
-	return fmt.Sprintf("bind(%s)", obj.Ident)
+	return "bind(" + obj.Ident + ")"
 }
 
 // Apply is a general purpose iterator method that operates on any AST node. It
@@ -403,7 +404,7 @@ type StmtRes struct {
 // String returns a short representation of this statement.
 func (obj *StmtRes) String() string {
 	// TODO: add .String() for Contents and Name
-	return fmt.Sprintf("res(%s)", obj.Kind)
+	return "res(" + obj.Kind + ")"
 }
 
 // Apply is a general purpose iterator method that operates on any AST node. It
@@ -1326,9 +1327,12 @@ func (obj *StmtRes) metaparams(table interfaces.Table) (func(engine.Res), error)
 
 		case "retry":
 			x := v.Int() // must not panic
-			// TODO: check that it doesn't overflow
+			if x > math.MaxInt16 || x < math.MinInt16 {
+				return nil, fmt.Errorf("retry value %d overflows int16", x)
+			}
+			retry := int16(x) // safe: bounds checked above
 			apply = append(apply, func(res engine.Res) {
-				res.MetaParams().Retry = int16(x)
+				res.MetaParams().Retry = retry
 			})
 
 		case "retryreset":
@@ -1338,16 +1342,33 @@ func (obj *StmtRes) metaparams(table interfaces.Table) (func(engine.Res), error)
 
 		case "delay":
 			x := v.Int() // must not panic
-			// TODO: check that it isn't signed
+			if x < 0 {
+				return nil, fmt.Errorf("delay value %d is negative", x)
+			}
+			delay := uint64(x) // safe: non-negative checked above
 			apply = append(apply, func(res engine.Res) {
-				res.MetaParams().Delay = uint64(x)
+				res.MetaParams().Delay = delay
+			})
+
+		case "timeout":
+			x := v.Int() // must not panic
+			if x < 0 {
+				return nil, fmt.Errorf("timeout value %d is negative", x)
+			}
+			timeout := uint64(x) // safe: non-negative checked above
+			apply = append(apply, func(res engine.Res) {
+				res.MetaParams().Timeout = timeout
 			})
 
 		case "poll":
 			x := v.Int() // must not panic
-			// TODO: check that it doesn't overflow and isn't signed
+			// TODO: check that it isn't signed
+			if x > math.MaxInt32 || x < math.MinInt32 {
+				return nil, fmt.Errorf("poll value %d overflows int32", x)
+			}
+			poll := int32(x) // safe: bounds checked above
 			apply = append(apply, func(res engine.Res) {
-				res.MetaParams().Poll = uint32(x)
+				res.MetaParams().Poll = poll
 			})
 
 		case "limit": // rate.Limit
@@ -1453,9 +1474,12 @@ func (obj *StmtRes) metaparams(table interfaces.Table) (func(engine.Res), error)
 			}
 			if val, exists := v.Struct()["retry"]; exists {
 				x := val.Int() // must not panic
-				// TODO: check that it doesn't overflow
+				if x > math.MaxInt16 || x < math.MinInt16 {
+					return nil, fmt.Errorf("retry value %d overflows int16", x)
+				}
+				retry := int16(x) // safe: bounds checked above
 				apply = append(apply, func(res engine.Res) {
-					res.MetaParams().Retry = int16(x)
+					res.MetaParams().Retry = retry
 				})
 			}
 			if val, exists := v.Struct()["retryreset"]; exists {
@@ -1465,16 +1489,32 @@ func (obj *StmtRes) metaparams(table interfaces.Table) (func(engine.Res), error)
 			}
 			if val, exists := v.Struct()["delay"]; exists {
 				x := val.Int() // must not panic
-				// TODO: check that it isn't signed
+				if x < 0 {
+					return nil, fmt.Errorf("delay value %d is negative", x)
+				}
+				delay := uint64(x) // safe: non-negative checked above
 				apply = append(apply, func(res engine.Res) {
-					res.MetaParams().Delay = uint64(x)
+					res.MetaParams().Delay = delay
+				})
+			}
+			if val, exists := v.Struct()["timeout"]; exists {
+				x := val.Int() // must not panic
+				if x < 0 {
+					return nil, fmt.Errorf("timeout value %d is negative", x)
+				}
+				timeout := uint64(x) // safe: non-negative checked above
+				apply = append(apply, func(res engine.Res) {
+					res.MetaParams().Timeout = timeout
 				})
 			}
 			if val, exists := v.Struct()["poll"]; exists {
 				x := val.Int() // must not panic
-				// TODO: check that it doesn't overflow and isn't signed
+				if x > math.MaxInt32 || x < math.MinInt32 {
+					return nil, fmt.Errorf("poll value %d overflows int32", x)
+				}
+				poll := int32(x) // safe: bounds checked above
 				apply = append(apply, func(res engine.Res) {
-					res.MetaParams().Poll = uint32(x)
+					res.MetaParams().Poll = poll
 				})
 			}
 			if val, exists := v.Struct()["limit"]; exists {
@@ -1617,7 +1657,7 @@ type StmtResField struct {
 // String returns a short representation of this statement.
 func (obj *StmtResField) String() string {
 	// TODO: add .String() for Condition and Value
-	return fmt.Sprintf("resfield(%s)", obj.Field)
+	return "resfield(" + obj.Field + ")"
 }
 
 // Apply is a general purpose iterator method that operates on any AST node. It
@@ -1902,7 +1942,7 @@ type StmtResEdge struct {
 // String returns a short representation of this statement.
 func (obj *StmtResEdge) String() string {
 	// TODO: add .String() for Condition and EdgeHalf
-	return fmt.Sprintf("resedge(%s)", obj.Property)
+	return "resedge(" + obj.Property + ")"
 }
 
 // Apply is a general purpose iterator method that operates on any AST node. It
@@ -2154,7 +2194,7 @@ type StmtResMeta struct {
 // String returns a short representation of this statement.
 func (obj *StmtResMeta) String() string {
 	// TODO: add .String() for Condition and MetaExpr
-	return fmt.Sprintf("resmeta(%s)", obj.Property)
+	return "resmeta(" + obj.Property + ")"
 }
 
 // Apply is a general purpose iterator method that operates on any AST node. It
@@ -2190,6 +2230,7 @@ func (obj *StmtResMeta) Init(data *interfaces.Data) error {
 	case "retry":
 	case "retryreset":
 	case "delay":
+	case "timeout":
 	case "poll":
 	case "limit":
 	case "burst":
@@ -2393,6 +2434,9 @@ func (obj *StmtResMeta) TypeCheck(kind string) ([]*interfaces.UnificationInvaria
 	case "delay":
 		typExpr = types.TypeInt
 
+	case "timeout":
+		typExpr = types.TypeInt
+
 	case "poll":
 		typExpr = types.TypeInt
 
@@ -2439,7 +2483,7 @@ func (obj *StmtResMeta) TypeCheck(kind string) ([]*interfaces.UnificationInvaria
 		// FIXME: allow partial subsets of this struct, and in any order
 		// FIXME: we might need an updated unification engine to do this
 		wrap := func(reverse *types.Type) *types.Type {
-			return types.NewType(fmt.Sprintf("struct{noop bool; retry int; retryreset bool; delay int; poll int; limit float; burst int; reset bool; sema []str; rewatch bool; realize bool; dollar bool; hidden bool; export []str; reverse %s; autoedge bool; autogroup bool}", reverse.String()))
+			return types.NewType(fmt.Sprintf("struct{noop bool; retry int; retryreset bool; delay int; timeout int; poll int; limit float; burst int; reset bool; sema []str; rewatch bool; realize bool; dollar bool; hidden bool; export []str; reverse %s; autoedge bool; autogroup bool}", reverse.String()))
 		}
 		// TODO: We might want more parameters about how to reverse.
 		typExpr = wrap(types.TypeBool)
@@ -2508,7 +2552,7 @@ type StmtResCollect struct {
 // String returns a short representation of this statement.
 func (obj *StmtResCollect) String() string {
 	// TODO: add .String() for Condition and Value
-	return fmt.Sprintf("rescollect(%s)", obj.Kind)
+	return "rescollect(" + obj.Kind + ")"
 }
 
 // Apply is a general purpose iterator method that operates on any AST node. It
@@ -3058,7 +3102,7 @@ type StmtEdgeHalf struct {
 // String returns a short representation of this statement.
 func (obj *StmtEdgeHalf) String() string {
 	// TODO: add .String() for Name
-	return fmt.Sprintf("edgehalf(%s)", obj.Kind)
+	return "edgehalf(" + obj.Kind + ")"
 }
 
 // Apply is a general purpose iterator method that operates on any AST node. It
@@ -3229,15 +3273,15 @@ type StmtIf struct {
 
 // String returns a short representation of this statement.
 func (obj *StmtIf) String() string {
-	s := fmt.Sprintf("if( %s )", obj.Condition.String())
+	s := "if( " + obj.Condition.String() + " )"
 
 	if obj.ThenBranch != nil {
-		s += fmt.Sprintf(" { %s }", obj.ThenBranch.String())
+		s += " { " + obj.ThenBranch.String() + " }"
 	} else {
 		s += " { }"
 	}
 	if obj.ElseBranch != nil {
-		s += fmt.Sprintf(" else { %s }", obj.ElseBranch.String())
+		s += " else { " + obj.ElseBranch.String() + " }"
 	}
 
 	return s
@@ -3626,10 +3670,10 @@ type StmtFor struct {
 // String returns a short representation of this statement.
 func (obj *StmtFor) String() string {
 	// TODO: improve/change this if needed
-	s := fmt.Sprintf("for($%s, $%s)", obj.Index, obj.Value)
-	s += fmt.Sprintf(" in %s", obj.Expr.String())
+	s := "for($" + obj.Index + ", $" + obj.Value + ")"
+	s += " in " + obj.Expr.String()
 	if obj.Body != nil {
-		s += fmt.Sprintf(" { %s }", obj.Body.String())
+		s += " { " + obj.Body.String() + " }"
 	}
 	return s
 }
@@ -3667,8 +3711,16 @@ func (obj *StmtFor) Init(data *interfaces.Data) error {
 			return err
 		}
 	}
-	// XXX: remove this check if we can!
-	for _, stmt := range obj.Body.(*StmtProg).Body {
+	if obj.Body == nil {
+		return nil
+	}
+
+	prog, ok := obj.Body.(*StmtProg)
+	if !ok {
+		return fmt.Errorf("the StmtFor body is not a program")
+	}
+	for _, stmt := range prog.Body {
+		// XXX: remove this check if we can!
 		if _, ok := stmt.(*StmtImport); !ok {
 			continue
 		}
@@ -3849,10 +3901,6 @@ func (obj *StmtFor) SetScope(scope *interfaces.Scope) error {
 		return err
 	}
 
-	if obj.Body == nil { // no loop body, we're done early
-		return nil
-	}
-
 	// We need to build the two ExprParam's here, and those will contain the
 	// type unification variables, so we might as well populate those parts
 	// now, rather than waiting for the subsequent TypeCheck step.
@@ -3871,6 +3919,7 @@ func (obj *StmtFor) SetScope(scope *interfaces.Scope) error {
 		obj.Index,
 		typExprIndex,
 	)
+	obj.indexParam.Textarea = obj.Textarea // inherit location from parent
 
 	typExprValue := obj.TypeValue
 	if obj.TypeValue == nil {
@@ -3883,11 +3932,16 @@ func (obj *StmtFor) SetScope(scope *interfaces.Scope) error {
 		obj.Value,
 		typExprValue,
 	)
+	obj.valueParam.Textarea = obj.Textarea // inherit location from parent
 
 	newScope := scope.Copy()
 	newScope.Iterated = true // important!
 	newScope.Variables[obj.Index] = obj.indexParam
 	newScope.Variables[obj.Value] = obj.valueParam
+
+	if obj.Body == nil { // no loop body, we're done early
+		return nil
+	}
 
 	return obj.Body.SetScope(newScope)
 }
@@ -4142,10 +4196,10 @@ type StmtForKV struct {
 // String returns a short representation of this statement.
 func (obj *StmtForKV) String() string {
 	// TODO: improve/change this if needed
-	s := fmt.Sprintf("forkv($%s, $%s)", obj.Key, obj.Val)
-	s += fmt.Sprintf(" in %s", obj.Expr.String())
+	s := "forkv($" + obj.Key + ", $" + obj.Val + ")"
+	s += " in " + obj.Expr.String()
 	if obj.Body != nil {
-		s += fmt.Sprintf(" { %s }", obj.Body.String())
+		s += " { " + obj.Body.String() + " }"
 	}
 	return s
 }
@@ -4183,8 +4237,16 @@ func (obj *StmtForKV) Init(data *interfaces.Data) error {
 			return err
 		}
 	}
-	// XXX: remove this check if we can!
-	for _, stmt := range obj.Body.(*StmtProg).Body {
+	if obj.Body == nil {
+		return nil
+	}
+
+	prog, ok := obj.Body.(*StmtProg)
+	if !ok {
+		return fmt.Errorf("the StmtForKV body is not a program")
+	}
+	for _, stmt := range prog.Body {
+		// XXX: remove this check if we can!
 		if _, ok := stmt.(*StmtImport); !ok {
 			continue
 		}
@@ -4365,10 +4427,6 @@ func (obj *StmtForKV) SetScope(scope *interfaces.Scope) error {
 		return err
 	}
 
-	if obj.Body == nil { // no loop body, we're done early
-		return nil
-	}
-
 	// We need to build the two ExprParam's here, and those will contain the
 	// type unification variables, so we might as well populate those parts
 	// now, rather than waiting for the subsequent TypeCheck step.
@@ -4384,6 +4442,7 @@ func (obj *StmtForKV) SetScope(scope *interfaces.Scope) error {
 		obj.Key,
 		typExprKey,
 	)
+	obj.keyParam.Textarea = obj.Textarea // inherit location from parent
 
 	typExprVal := obj.TypeVal
 	if obj.TypeVal == nil {
@@ -4396,11 +4455,16 @@ func (obj *StmtForKV) SetScope(scope *interfaces.Scope) error {
 		obj.Val,
 		typExprVal,
 	)
+	obj.valParam.Textarea = obj.Textarea // inherit location from parent
 
 	newScope := scope.Copy()
 	newScope.Iterated = true // important!
 	newScope.Variables[obj.Key] = obj.keyParam
 	newScope.Variables[obj.Val] = obj.valParam
+
+	if obj.Body == nil { // no loop body, we're done early
+		return nil
+	}
 
 	return obj.Body.SetScope(newScope)
 }
@@ -6251,7 +6315,7 @@ type StmtFunc struct {
 
 // String returns a short representation of this statement.
 func (obj *StmtFunc) String() string {
-	return fmt.Sprintf("func(%s)", obj.Name)
+	return "func(" + obj.Name + ")"
 }
 
 // Apply is a general purpose iterator method that operates on any AST node. It
@@ -6467,7 +6531,7 @@ type StmtClass struct {
 
 // String returns a short representation of this statement.
 func (obj *StmtClass) String() string {
-	return fmt.Sprintf("class(%s)", obj.Name)
+	return "class(" + obj.Name + ")"
 }
 
 // Apply is a general purpose iterator method that operates on any AST node. It
@@ -6682,7 +6746,7 @@ type StmtInclude struct {
 
 // String returns a short representation of this statement.
 func (obj *StmtInclude) String() string {
-	return fmt.Sprintf("include(%s)", obj.Name)
+	return "include(" + obj.Name + ")"
 }
 
 // Apply is a general purpose iterator method that operates on any AST node. It
@@ -7176,7 +7240,7 @@ type StmtImport struct {
 
 // String returns a short representation of this statement.
 func (obj *StmtImport) String() string {
-	return fmt.Sprintf("import(%s)", obj.Name)
+	return "import(" + obj.Name + ")"
 }
 
 // Apply is a general purpose iterator method that operates on any AST node. It
@@ -7283,7 +7347,7 @@ type StmtComment struct {
 
 // String returns a short representation of this statement.
 func (obj *StmtComment) String() string {
-	return fmt.Sprintf("comment(%s)", obj.Value)
+	return "comment(" + obj.Value + ")"
 }
 
 // Apply is a general purpose iterator method that operates on any AST node. It
@@ -7308,7 +7372,8 @@ func (obj *StmtComment) Init(data *interfaces.Data) error {
 // Here it simply returns itself, as no interpolation is possible.
 func (obj *StmtComment) Interpolate() (interfaces.Stmt, error) {
 	return &StmtComment{
-		Value: obj.Value,
+		Textarea: obj.Textarea,
+		Value:    obj.Value,
 	}, nil
 }
 
@@ -7368,7 +7433,7 @@ type ExprBool struct {
 }
 
 // String returns a short representation of this expression.
-func (obj *ExprBool) String() string { return fmt.Sprintf("bool(%t)", obj.V) }
+func (obj *ExprBool) String() string { return "bool(" + strconv.FormatBool(obj.V) + ")" }
 
 // Apply is a general purpose iterator method that operates on any AST node. It
 // is not used as the primary AST traversal function because it is less readable
@@ -7524,7 +7589,7 @@ type ExprStr struct {
 }
 
 // String returns a short representation of this expression.
-func (obj *ExprStr) String() string { return fmt.Sprintf("str(%s)", strconv.Quote(obj.V)) }
+func (obj *ExprStr) String() string { return "str(" + strconv.Quote(obj.V) + ")" }
 
 // Apply is a general purpose iterator method that operates on any AST node. It
 // is not used as the primary AST traversal function because it is less readable
@@ -7722,7 +7787,7 @@ type ExprInt struct {
 }
 
 // String returns a short representation of this expression.
-func (obj *ExprInt) String() string { return fmt.Sprintf("int(%d)", obj.V) }
+func (obj *ExprInt) String() string { return "int(" + strconv.FormatInt(obj.V, 10) + ")" }
 
 // Apply is a general purpose iterator method that operates on any AST node. It
 // is not used as the primary AST traversal function because it is less readable
@@ -7878,7 +7943,8 @@ type ExprFloat struct {
 
 // String returns a short representation of this expression.
 func (obj *ExprFloat) String() string {
-	return fmt.Sprintf("float(%g)", obj.V) // TODO: %f instead?
+	//return fmt.Sprintf("float(%g)", obj.V) // TODO: %f instead?
+	return "float(" + strconv.FormatFloat(obj.V, 'g', -1, 64) + ")" // %g with Sprintf
 }
 
 // Apply is a general purpose iterator method that operates on any AST node. It
@@ -8041,7 +8107,7 @@ func (obj *ExprList) String() string {
 	for _, x := range obj.Elements {
 		s = append(s, x.String())
 	}
-	return fmt.Sprintf("list(%s)", strings.Join(s, ", "))
+	return "list(" + strings.Join(s, ", ") + ")"
 }
 
 // Apply is a general purpose iterator method that operates on any AST node. It
@@ -8323,7 +8389,7 @@ func (obj *ExprList) Graph(env *interfaces.Env) (*pgraph.Graph, interfaces.Func,
 		}
 		graph.AddGraph(g)
 
-		fieldName := fmt.Sprintf("%d", index) // argNames as integers!
+		fieldName := strconv.Itoa(index) // argNames as integers!
 		edge := &interfaces.FuncEdge{Args: []string{fieldName}}
 		graph.AddEdge(f, function, edge) // element -> list
 	}
@@ -8405,9 +8471,9 @@ type ExprMap struct {
 func (obj *ExprMap) String() string {
 	var s []string
 	for _, x := range obj.KVs {
-		s = append(s, fmt.Sprintf("%s: %s", x.Key.String(), x.Val.String()))
+		s = append(s, x.Key.String()+": "+x.Val.String())
 	}
-	return fmt.Sprintf("map(%s)", strings.Join(s, ", "))
+	return "map(" + strings.Join(s, ", ") + ")"
 }
 
 // Apply is a general purpose iterator method that operates on any AST node. It
@@ -8475,7 +8541,7 @@ func (obj *ExprMap) Init(data *interfaces.Data) error {
 	}
 
 	// The `nil` type is not important, we just need any stand-in.
-	mapTyp := types.NewType(fmt.Sprintf("map{%s: nil}", typ.String()))
+	mapTyp := types.NewType("map{" + typ.String() + ": nil}")
 	m := mapTyp.New().(*types.MapValue)
 	if m == nil {
 		// If you build a map with an invalid type, then it will be nil.
@@ -8838,7 +8904,7 @@ func (obj *ExprMap) Graph(env *interfaces.Env) (*pgraph.Graph, interfaces.Func, 
 		graph.AddGraph(g)
 
 		// do the key names ever change? -- yes
-		fieldName := fmt.Sprintf("key:%d", index) // stringify map key
+		fieldName := "key:" + strconv.Itoa(index) // stringify map key
 		edge := &interfaces.FuncEdge{Args: []string{fieldName}}
 		graph.AddEdge(f, function, edge) // key -> map
 	}
@@ -8851,7 +8917,7 @@ func (obj *ExprMap) Graph(env *interfaces.Env) (*pgraph.Graph, interfaces.Func, 
 		}
 		graph.AddGraph(g)
 
-		fieldName := fmt.Sprintf("val:%d", index) // stringify map val
+		fieldName := "val:" + strconv.Itoa(index) // stringify map val
 		edge := &interfaces.FuncEdge{Args: []string{fieldName}}
 		graph.AddEdge(f, function, edge) // val -> map
 	}
@@ -8978,9 +9044,9 @@ type ExprStruct struct {
 func (obj *ExprStruct) String() string {
 	var s []string
 	for _, x := range obj.Fields {
-		s = append(s, fmt.Sprintf("%s: %s", x.Name, x.Value.String()))
+		s = append(s, x.Name+": "+x.Value.String())
 	}
-	return fmt.Sprintf("struct(%s)", strings.Join(s, "; "))
+	return "struct(" + strings.Join(s, "; ") + ")"
 }
 
 // Apply is a general purpose iterator method that operates on any AST node. It
@@ -9424,18 +9490,18 @@ type ExprFunc struct {
 func (obj *ExprFunc) String() string {
 	if len(obj.Values) == 1 {
 		if obj.Title != "" {
-			return fmt.Sprintf("func() { <built-in:%s (simple)> }", obj.Title)
+			return "func() { <built-in:" + obj.Title + " (simple)> }"
 		}
 		return "func() { <built-in (simple)> }"
 	} else if len(obj.Values) > 0 {
 		if obj.Title != "" {
-			return fmt.Sprintf("func() { <built-in:%s (simple, poly)> }", obj.Title)
+			return "func() { <built-in:" + obj.Title + " (simple, poly)> }"
 		}
 		return "func() { <built-in (simple, poly)> }"
 	}
 	if obj.Function != nil {
 		if obj.Title != "" {
-			return fmt.Sprintf("func() { <built-in:%s> }", obj.Title)
+			return "func() { <built-in:" + obj.Title + "> }"
 		}
 		return "func() { <built-in> }"
 	}
@@ -9448,14 +9514,14 @@ func (obj *ExprFunc) String() string {
 		a = append(a, x.String())
 	}
 	args := strings.Join(a, ", ")
-	s := fmt.Sprintf("func(%s)", args)
+	s := "func(" + args + ")"
 	if obj.Title != "" {
-		s = fmt.Sprintf("func:%s(%s)", obj.Title, args) // overwrite!
+		s = "func:" + obj.Title + "(" + args + ")" // overwrite!
 	}
 	if obj.Return != nil {
-		s += fmt.Sprintf(" %s", obj.Return.String())
+		s += " " + obj.Return.String()
 	}
-	s += fmt.Sprintf(" { %s }", obj.Body.String())
+	s += " { " + obj.Body.String() + " }"
 	return s
 }
 
@@ -9483,7 +9549,7 @@ func (obj *ExprFunc) Init(data *interfaces.Data) error {
 	a := obj.Body != nil
 	b := obj.Function != nil
 	c := len(obj.Values) > 0
-	if (a && b || b && c) || !a && !b && !c {
+	if (a && b) || (b && c) || (c && a) || (!a && !b && !c) {
 		return fmt.Errorf("function expression was not built correctly")
 	}
 
@@ -9499,6 +9565,12 @@ func (obj *ExprFunc) Init(data *interfaces.Data) error {
 			return fmt.Errorf("func is being re-built")
 		}
 		obj.function = obj.Function() // build it
+		if obj.function == nil {
+			return fmt.Errorf("function constructor returned nil")
+		}
+		if tf, ok := obj.function.(interfaces.TextareaSettable); ok {
+			tf.SetTextarea(obj.Textarea)
+		}
 		// pass in some data to the function
 		// TODO: do we want to pass in the full obj.data instead ?
 		if dataFunc, ok := obj.function.(interfaces.DataFunc); ok {
@@ -9513,6 +9585,9 @@ func (obj *ExprFunc) Init(data *interfaces.Data) error {
 	if len(obj.Values) > 0 {
 		typs := []*types.Type{}
 		for _, f := range obj.Values {
+			if f == nil {
+				return fmt.Errorf("func contains a nil value")
+			}
 			if f.T == nil {
 				return fmt.Errorf("func contains a nil type signature")
 			}
@@ -9737,6 +9812,7 @@ func (obj *ExprFunc) SetScope(scope *interfaces.Scope, sctx map[string]interface
 				arg.Name,
 				arg.Type,
 			)
+			param.Textarea = obj.Textarea // inherit location from parent func
 			obj.params[i] = param
 			sctxBody[arg.Name] = param
 		}
@@ -10118,6 +10194,9 @@ func (obj *ExprFunc) Graph(env *interfaces.Env) (*pgraph.Graph, interfaces.Func,
 				return nil, fmt.Errorf("the ExprFunc.Copy() does not produce an ExprFunc")
 			}
 			valueTransformingFunc := funcExprCopy.function
+			if tf, ok := valueTransformingFunc.(interfaces.TextareaSettable); ok {
+				tf.SetTextarea(obj.Textarea)
+			}
 			txn.AddVertex(valueTransformingFunc)
 			for i, arg := range args {
 				argName := obj.typ.Ord[i]
@@ -10166,7 +10245,7 @@ func (obj *ExprFunc) Graph(env *interfaces.Env) (*pgraph.Graph, interfaces.Func,
 		simpleFn := obj.Values[index]
 		simpleFn.T = obj.typ
 
-		funcValueFunc = structs.SimpleFnToConstFunc(fmt.Sprintf("title: %s", obj.Title), simpleFn)
+		funcValueFunc = structs.SimpleFnToConstFunc("title: "+obj.Title, simpleFn)
 	}
 
 	outerGraph, err := pgraph.NewGraph("ExprFunc")
@@ -10300,7 +10379,7 @@ func (obj *ExprFunc) Value() (types.Value, error) {
 		// *full.FuncValue implementation to make new functions when it
 		// gets called. We'll need more than one so they're not the same
 		// pointer!
-		return structs.FuncToFullFuncValue(copyFunc, obj.typ), nil
+		return structs.FuncToFullFuncValue(copyFunc, obj.typ, obj.Textarea), nil
 	}
 	// else if /* len(obj.Values) > 0 */
 
@@ -10366,7 +10445,7 @@ func (obj *ExprCall) String() string {
 	if obj.Name == "" && obj.Anon != nil {
 		name = "<anon>"
 	}
-	return fmt.Sprintf("call:%s(%s)", name, strings.Join(s, ", "))
+	return "call:" + name + "(" + strings.Join(s, ", ") + ")"
 }
 
 // Apply is a general purpose iterator method that operates on any AST node. It
@@ -10396,6 +10475,9 @@ func (obj *ExprCall) Init(data *interfaces.Data) error {
 
 	if obj.Name == "" && obj.Anon == nil {
 		return fmt.Errorf("missing call name")
+	}
+	if obj.Anon != nil && (obj.Name != "" || obj.Var) {
+		return fmt.Errorf("anon call is invalid")
 	}
 
 	for _, x := range obj.Args {
@@ -11017,7 +11099,7 @@ func (obj *ExprCall) Infer() (*types.Type, []*interfaces.UnificationInvariant, e
 			// return them directly.
 			typ, invars, err := inferableFn.FuncInfer(partialType, partialValues)
 			if err != nil {
-				return nil, nil, errwrap.Wrapf(err, "func `%s` infer error", exprFunc.Title)
+				return nil, nil, interfaces.HighlightHelper(obj, obj.data.Logf, errwrap.Wrapf(err, "func `%s` infer error", exprFunc.Title))
 			}
 			invariants = append(invariants, invars...)
 			if typ == nil { // should get a sig, not a nil!
@@ -11044,6 +11126,7 @@ func (obj *ExprCall) Infer() (*types.Type, []*interfaces.UnificationInvariant, e
 
 		// TODO: Do we need to link obj.expr to exprFunc, eg:
 		//invar2 := &interfaces.UnificationInvariant{
+		//	Node:   obj,
 		//	Expr:   exprFunc, // trueCallee variant
 		//	Expect: typFunc,
 		//	Actual: typFn,
@@ -11137,6 +11220,11 @@ func (obj *ExprCall) Graph(env *interfaces.Env) (*pgraph.Graph, interfaces.Func,
 		outputFunc, err := exprFuncValue.CallWithFuncs(txn, argFuncs)
 		if err != nil {
 			return nil, nil, errwrap.Wrapf(err, "could not construct the static graph for a function call")
+		}
+		// Propagate ExprCall source position to functions created
+		// during speculation so dage errors include file/line info.
+		if tf, ok := outputFunc.(interfaces.TextareaSettable); ok && obj.Textarea.IsSet() {
+			tf.SetTextarea(obj.Textarea)
 		}
 		txn.AddVertex(outputFunc)
 
@@ -11350,7 +11438,7 @@ type ExprVar struct {
 }
 
 // String returns a short representation of this expression.
-func (obj *ExprVar) String() string { return fmt.Sprintf("var(%s)", obj.Name) }
+func (obj *ExprVar) String() string { return "var(" + obj.Name + ")" }
 
 // Apply is a general purpose iterator method that operates on any AST node. It
 // is not used as the primary AST traversal function because it is less readable
@@ -11442,31 +11530,35 @@ func (obj *ExprVar) Ordering(produces map[string]interfaces.Node) (*pgraph.Graph
 
 // SetScope stores the scope for use in this resource.
 func (obj *ExprVar) SetScope(scope *interfaces.Scope, sctx map[string]interfaces.Expr) error {
+	// We don't copy the scope here, since we only read from it below. This
+	// node is the most common one in the AST, and copying the whole scope
+	// for every variable reference was a big chunk of all the compiler
+	// allocations. Everyone who mutates a scope copies it first, so it's
+	// safe to share. (Sam was right, we didn't need to copy this.)
 	obj.scope = interfaces.EmptyScope()
 	if scope != nil {
-		obj.scope = scope.Copy() // XXX: Sam says we probably don't need to copy this.
+		obj.scope = scope
 	}
 
 	if monomorphicTarget, exists := sctx[obj.Name]; exists {
 		// This ExprVar refers to a parameter bound by an enclosing
-		// lambda definition.
+		// lambda definition. We need to mutate the scope to store it,
+		// so *now* we copy, since the original is shared with others.
+		obj.scope = obj.scope.Copy()
 		obj.scope.Variables[obj.Name] = monomorphicTarget
 
-		// There is no need to scope-check the target, it's just a
-		// an ExprParam with no internal references.
+		// There is no need to scope-check the target, it's just an
+		// ExprParam with no internal references.
 		return nil
 	}
 
-	target, exists := obj.scope.Variables[obj.Name]
-	if !exists {
+	if _, exists := obj.scope.Variables[obj.Name]; !exists {
 		if obj.data.Debug || true { // TODO: leave this on permanently?
 			variableScopeFeedback(obj.scope, obj.data.Logf)
 		}
 		err := fmt.Errorf("var `$%s` does not exist in this scope", obj.Name)
 		return interfaces.HighlightHelper(obj, obj.data.Logf, err)
 	}
-
-	obj.scope.Variables[obj.Name] = target
 
 	// This ExprVar refers to a top-level definition which has already been
 	// scope-checked, so we don't need to scope-check it again.
@@ -11629,6 +11721,8 @@ func (obj *ExprVar) Value() (types.Value, error) {
 
 // ExprParam represents a parameter to a function.
 type ExprParam struct {
+	interfaces.Textarea
+
 	typ *types.Type
 
 	Name string // name of the parameter
@@ -11637,9 +11731,7 @@ type ExprParam struct {
 }
 
 // String returns a short representation of this expression.
-func (obj *ExprParam) String() string {
-	return fmt.Sprintf("param(%s)", obj.Name)
-}
+func (obj *ExprParam) String() string { return "param(" + obj.Name + ")" }
 
 // Apply is a general purpose iterator method that operates on any AST node. It
 // is not used as the primary AST traversal function because it is less readable
@@ -11659,8 +11751,9 @@ func (obj *ExprParam) Init(*interfaces.Data) error {
 // on any child elements and builds the new node with those new node contents.
 func (obj *ExprParam) Interpolate() (interfaces.Expr, error) {
 	expr := &ExprParam{
-		typ:  obj.typ,
-		Name: obj.Name,
+		Textarea: obj.Textarea,
+		typ:      obj.typ,
+		Name:     obj.Name,
 	}
 	expr.envKey = expr
 	return expr, nil
@@ -11673,9 +11766,10 @@ func (obj *ExprParam) Interpolate() (interfaces.Expr, error) {
 // and they won't be able to have different values.
 func (obj *ExprParam) Copy() (interfaces.Expr, error) {
 	return &ExprParam{
-		typ:    obj.typ,
-		Name:   obj.Name,
-		envKey: obj.envKey, // don't copy
+		Textarea: obj.Textarea,
+		typ:      obj.typ,
+		Name:     obj.Name,
+		envKey:   obj.envKey, // don't copy
 	}, nil
 }
 
@@ -11853,7 +11947,7 @@ type ExprIterated struct {
 
 // String returns a short representation of this expression.
 func (obj *ExprIterated) String() string {
-	return fmt.Sprintf("iterated(%v %s)", obj.Definition, obj.Name)
+	return "iterated(" + obj.Definition.String() + " " + obj.Name + ")"
 }
 
 // Apply is a general purpose iterator method that operates on any AST node. It
@@ -11976,6 +12070,7 @@ func (obj *ExprIterated) Infer() (*types.Type, []*interfaces.UnificationInvarian
 
 	// This adds the obj ptr, so it's seen as an expr that we need to solve.
 	invar := &interfaces.UnificationInvariant{
+		Node:   obj,
 		Expr:   obj,
 		Expect: typ,
 		Actual: typ,
@@ -12036,7 +12131,7 @@ type ExprPoly struct {
 
 // String returns a short representation of this expression.
 func (obj *ExprPoly) String() string {
-	return fmt.Sprintf("polymorphic(%s)", obj.Definition.String())
+	return "polymorphic(" + obj.Definition.String() + ")"
 }
 
 // Apply is a general purpose iterator method that operates on any AST node. It
@@ -12160,7 +12255,7 @@ type ExprTopLevel struct {
 
 // String returns a short representation of this expression.
 func (obj *ExprTopLevel) String() string {
-	return fmt.Sprintf("topLevel(%s)", obj.Definition.String())
+	return "topLevel(" + obj.Definition.String() + ")"
 }
 
 // Apply is a general purpose iterator method that operates on any AST node. It
@@ -12344,7 +12439,7 @@ type ExprSingleton struct {
 
 // String returns a short representation of this expression.
 func (obj *ExprSingleton) String() string {
-	return fmt.Sprintf("singleton(%s)", obj.Definition.String())
+	return "singleton(" + obj.Definition.String() + ")"
 }
 
 // Apply is a general purpose iterator method that operates on any AST node. It
@@ -12562,7 +12657,7 @@ func (obj *ExprIf) String() string {
 	condition := obj.Condition.String()
 	thenBranch := obj.ThenBranch.String()
 	elseBranch := obj.ElseBranch.String()
-	return fmt.Sprintf("if( %s ) { %s } else { %s }", condition, thenBranch, elseBranch)
+	return "if( " + condition + " ) { " + thenBranch + " } else { " + elseBranch + " }"
 }
 
 // Apply is a general purpose iterator method that operates on any AST node. It
@@ -12778,41 +12873,32 @@ func (obj *ExprIf) Type() (*types.Type, error) {
 		return obj.typ, nil
 	}
 
-	var typ *types.Type
-	testAndSet := func(t *types.Type) error {
-		if t == nil {
-			return nil // skip
-		}
-		if typ == nil {
-			return nil // it's ok
-		}
-
-		if typ.Cmp(t) != nil {
-			return fmt.Errorf("inconsistent branch")
-		}
-		typ = t // save
-
-		return nil
-	}
-
+	var t1 *types.Type
 	if obj.ThenBranch != nil {
-		if t, err := obj.ThenBranch.Type(); err != nil {
-			if err := testAndSet(t); err != nil {
-				return nil, err
-			}
+		if t, err := obj.ThenBranch.Type(); err == nil {
+			t1 = t
 		}
 	}
+	var t2 *types.Type
 	if obj.ElseBranch != nil {
-		if t, err := obj.ElseBranch.Type(); err != nil {
-			if err := testAndSet(t); err != nil {
-				return nil, err
-			}
+		if t, err := obj.ElseBranch.Type(); err == nil {
+			t2 = t
 		}
 	}
 
-	if typ != nil {
-		return typ, nil
+	// If only one branch is known, return that.
+	if t1 == nil && t2 != nil {
+		return t2, nil
 	}
+	if t1 != nil && t2 == nil {
+		return t1, nil
+	}
+
+	// If both branches have the same type, we can assume it's that type.
+	if t1 != nil && t2 != nil {
+		return t1, errwrap.Wrapf(t1.Cmp(t2), "inconsistent branch")
+	}
+
 	return nil, errwrap.Wrapf(interfaces.ErrTypeCurrentlyUnknown, "%s", obj.String())
 }
 

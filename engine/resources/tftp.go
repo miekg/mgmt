@@ -34,12 +34,15 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/purpleidea/mgmt/engine"
 	"github.com/purpleidea/mgmt/engine/traits"
@@ -70,7 +73,8 @@ const (
 // This resource can offer up files for serving that are specified either inline
 // in this resource by specifying a tftp root, or as tftp:file resources which
 // will get autogrouped into this resource at runtime. The two methods can be
-// combined as well.
+// combined as well. The resource does *not* start serving until CheckApply for
+// the resource runs.
 type TFTPServerRes struct {
 	traits.Base      // add the base methods without re-implementation
 	traits.Edgeable  // XXX: add autoedge support
@@ -93,6 +97,11 @@ type TFTPServerRes struct {
 	Root string `lang:"root" yaml:"root"`
 
 	// TODO: should we allow adding a list of one-of files directly here?
+
+	once  *sync.Once
+	start chan struct{} // closes by once
+
+	wg *sync.WaitGroup
 }
 
 // Default returns some sensible defaults for this resource.
@@ -143,6 +152,16 @@ func (obj *TFTPServerRes) Validate() error {
 func (obj *TFTPServerRes) Init(init *engine.Init) error {
 	obj.init = init // save for later
 
+	// TODO: should we do this in the engine? Do we want to decide it here?
+	for _, res := range obj.GetGroup() { // grouped elements
+		if err := res.Init(init); err != nil {
+			return errwrap.Wrapf(err, "autogrouped Init failed")
+		}
+	}
+
+	obj.once = &sync.Once{}
+	obj.start = make(chan struct{})
+
 	return nil
 }
 
@@ -153,6 +172,9 @@ func (obj *TFTPServerRes) Cleanup() error {
 
 // Watch is the primary listener for this resource and it outputs events.
 func (obj *TFTPServerRes) Watch(ctx context.Context) error {
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(context.Canceled)
+
 	addr, err := net.ResolveUDPAddr("udp", obj.getAddress())
 	if err != nil {
 		return errwrap.Wrapf(err, "could not resolve address")
@@ -164,64 +186,67 @@ func (obj *TFTPServerRes) Watch(ctx context.Context) error {
 	}
 	defer conn.Close()
 
+	if err := obj.init.Event(ctx); err != nil {
+		return err
+	}
+
+	select {
+	case <-obj.start: // opened by CheckApply after runtime checks succeed
+	case <-ctx.Done(): // closed by the engine to signal shutdown
+		return context.Cause(ctx)
+	}
+	// XXX: Should we even do this drain? Do we move start above ListenUDP?
+	if err := tftpDrainUDPConn(conn); err != nil {
+		return errwrap.Wrapf(err, "could not drain queued packets")
+	}
+
 	hook := obj.hook()
 	if hook == nil {
 		return fmt.Errorf("the hook is nil") // programming error
 	}
 
-	obj.init.Running() // when started, notify engine that we're running
-
 	// Use nil in place of handler to disable read or write operations.
-	server := tftp.NewServer(obj.readHandler(), obj.writeHandler())
+	server := tftp.NewServer(obj.readHandler(ctx), obj.writeHandler())
+	//nolint:gosec // G115: timeout is trusted operator config in s; only wraps above 2^63
 	server.SetTimeout(time.Duration(obj.Timeout) * time.Second) // optional
+	server.SetBackoff(func(int) time.Duration {
+		// Match the library's default randomized retry delay while
+		// running, but skip it once shutdown starts so active transfers
+		// can drain.
+		select {
+		case <-ctx.Done():
+			return 0
+		default:
+			//nolint:gosec // G404: jitter for retry backoff, not security-sensitive
+			return time.Duration(rand.Int63n(int64(time.Second)))
+		}
+	})
 	server.SetHook(hook)
 
-	var closeError error
-	closeSignal := make(chan struct{})
+	obj.wg = &sync.WaitGroup{}
+	defer obj.wg.Wait()
 
-	wg := &sync.WaitGroup{}
-	defer wg.Wait()
-
-	wg.Add(1)
+	obj.wg.Add(1)
 	go func() {
-		defer wg.Done()
-		defer close(closeSignal)
+		defer obj.wg.Done()
 
 		err := server.Serve(conn) // blocks until Shutdown() is called!
 		if err == nil {
+			cancel(nil)
 			return
 		}
-		// if this returned on its own, then closeSignal can be used...
-		closeError = errwrap.Wrapf(err, "the server errored")
+		cancel(errwrap.Wrapf(err, "the server errored"))
 	}()
 	defer server.Shutdown()
 
-	startupChan := make(chan struct{})
-	close(startupChan) // send one initial signal
-
-	for {
-		if obj.init.Debug {
-			obj.init.Logf("Looping...")
-		}
-
-		select {
-		case <-startupChan:
-			startupChan = nil
-
-		case <-closeSignal: // something shut us down early
-			return closeError
-
-		case <-ctx.Done(): // closed by the engine to signal shutdown
-			return nil
-		}
-
-		obj.init.Event() // notify engine of an event (this can block)
+	select {
+	case <-ctx.Done(): // closed by the engine to signal shutdown
+		return context.Cause(ctx)
 	}
 }
 
-// CheckApply never has anything to do for this resource, so it always succeeds.
-// It does however check that certain runtime requirements (such as the Root dir
-// existing if one was specified) are fulfilled.
+// CheckApply never has anything to apply for this resource. It does however
+// check that runtime requirements are fulfilled before Watch starts serving.
 func (obj *TFTPServerRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 	if obj.init.Debug {
 		obj.init.Logf("CheckApply")
@@ -238,7 +263,20 @@ func (obj *TFTPServerRes) CheckApply(ctx context.Context, apply bool) (bool, err
 		}
 	}
 
-	return true, nil // always succeeds, with nothing to do!
+	checkOK := true
+	for _, res := range obj.GetGroup() { // grouped elements
+		if c, err := res.CheckApply(ctx, apply); err != nil {
+			return false, errwrap.Wrapf(err, "autogrouped CheckApply failed")
+		} else if !c {
+			checkOK = false
+		}
+	}
+
+	if checkOK {
+		obj.once.Do(func() { close(obj.start) })
+	}
+
+	return checkOK, nil
 }
 
 // Cmp compares two resources and returns an error if they are not equivalent.
@@ -311,7 +349,7 @@ func (obj *TFTPServerRes) GroupCmp(r engine.GroupableRes) error {
 }
 
 // readHandler handles all the incoming download requests from clients.
-func (obj *TFTPServerRes) readHandler() func(string, io.ReaderFrom) error {
+func (obj *TFTPServerRes) readHandler(ctx context.Context) func(string, io.ReaderFrom) error {
 	return func(filename string, rf io.ReaderFrom) error {
 		raddr := rf.(tftp.OutgoingTransfer).RemoteAddr()
 		laddr := rf.(tftp.RequestPacketInfo).LocalIP() // may be nil
@@ -400,8 +438,39 @@ func (obj *TFTPServerRes) readHandler() func(string, io.ReaderFrom) error {
 		// NOTE: os.File does for example.
 		//rf.(tftp.OutgoingTransfer).SetSize(myFileSize)
 
+		// XXX: This is a giant (clever) hack to disconnect readers who
+		// are misbehaving or otherwise. There may be a better way to
+		// prevent needing this hack, but until it is found, at least do
+		// something. See more at: https://github.com/pin/tftp/issues/41
+		transfer, err := tftpTransferConn(rf)
+		if err != nil && obj.init.Debug {
+			obj.init.Logf("could not get transfer connection: %+v", err)
+		}
+		done := make(chan struct{})
+		if transfer != nil {
+			defer close(done)
+			obj.wg.Add(1)
+			go func() {
+				defer obj.wg.Done()
+
+				select {
+				case <-ctx.Done():
+					_ = transfer.Close() // this unblocks ReadFrom
+				case <-done:
+				}
+			}()
+		}
+		if closer, ok := handle.(io.Closer); ok {
+			defer closer.Close()
+		}
+
 		n, err := rf.ReadFrom(handle)
 		if err != nil {
+			select {
+			case <-ctx.Done():
+				return context.Cause(ctx)
+			default:
+			}
 			obj.init.Logf("could not read %s, error: %+v", filename, err)
 			// don't leak additional information to client!
 			return fmt.Errorf("could not read: %s", filename)
@@ -556,21 +625,38 @@ func (obj *TFTPFileRes) Cleanup() error {
 // particular one does absolutely nothing but block until we've received a done
 // signal.
 func (obj *TFTPFileRes) Watch(ctx context.Context) error {
-	obj.init.Running() // when started, notify engine that we're running
+	if err := obj.init.Event(ctx); err != nil {
+		return err
+	}
 
 	select {
 	case <-ctx.Done(): // closed by the engine to signal shutdown
 	}
 
-	//obj.init.Event() // notify engine of an event (this can block)
-
-	return nil
+	return ctx.Err()
 }
 
-// CheckApply never has anything to do for this resource, so it always succeeds.
+// CheckApply never has anything to apply for this resource. It does however
+// check that the source Path can be served if one was specified.
 func (obj *TFTPFileRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 	if obj.init.Debug {
 		obj.init.Logf("CheckApply")
+	}
+
+	if obj.Path != "" {
+		fileInfo, err := os.Stat(obj.Path)
+		if err != nil {
+			return false, errwrap.Wrapf(err, "can't stat Path")
+		}
+		if fileInfo.IsDir() {
+			return false, fmt.Errorf("the Path is a dir")
+		}
+
+		handle, err := os.Open(obj.Path)
+		if err != nil {
+			return false, errwrap.Wrapf(err, "can't open Path")
+		}
+		defer handle.Close()
 	}
 
 	return true, nil // always succeeds, with nothing to do!
@@ -618,4 +704,71 @@ func (obj *TFTPFileRes) UnmarshalYAML(unmarshal func(interface{}) error) error {
 
 	*obj = TFTPFileRes(raw) // restore from indirection with type conversion!
 	return nil
+}
+
+// tftpTransferConn returns the per-transfer UDP connection owned by the tftp
+// library. The library does not expose a way to interrupt one blocked transfer,
+// so we capture the connection before ReadFrom starts and close it if the
+// resource context is cancelled.
+func tftpTransferConn(rf io.ReaderFrom) (*net.UDPConn, error) {
+	value := reflect.ValueOf(rf)
+	if value.Kind() != reflect.Pointer || value.IsNil() {
+		return nil, fmt.Errorf("unexpected transfer type: %T", rf)
+	}
+
+	value = value.Elem()
+	connField := value.FieldByName("conn")
+	if !connField.IsValid() {
+		return nil, fmt.Errorf("missing transfer connection")
+	}
+	if connField.IsNil() {
+		return nil, fmt.Errorf("nil transfer connection")
+	}
+
+	//nolint:gosec // G103: reflection into the tftp library's unexported conn field
+	connValue := reflect.NewAt(connField.Type(), unsafe.Pointer(connField.UnsafeAddr())).Elem()
+	conn := reflect.ValueOf(connValue.Interface())
+	if conn.Kind() == reflect.Interface {
+		conn = conn.Elem()
+	}
+	if conn.Kind() != reflect.Pointer || conn.IsNil() {
+		return nil, fmt.Errorf("unexpected connection type: %T", connValue.Interface())
+	}
+
+	conn = conn.Elem()
+	udpField := conn.FieldByName("conn")
+	if !udpField.IsValid() {
+		return nil, fmt.Errorf("missing UDP connection")
+	}
+	if udpField.IsNil() {
+		return nil, fmt.Errorf("nil UDP connection")
+	}
+
+	//nolint:gosec // G103: reflection into the library's unexported UDP conn field
+	udpValue := reflect.NewAt(udpField.Type(), unsafe.Pointer(udpField.UnsafeAddr())).Elem()
+	udpConn, ok := udpValue.Interface().(*net.UDPConn)
+	if !ok {
+		return nil, fmt.Errorf("unexpected UDP connection type: %T", udpValue.Interface())
+	}
+	return udpConn, nil
+}
+
+// tftpDrainUDPConn discards datagrams queued while Watch was waiting for the
+// first successful CheckApply. Those requests arrived before the resource was
+// allowed to serve, so they must not be handled after the gate opens.
+func tftpDrainUDPConn(conn *net.UDPConn) error {
+	if err := conn.SetReadDeadline(time.Now().Add(time.Millisecond)); err != nil {
+		return err
+	}
+	defer conn.SetReadDeadline(time.Time{})
+
+	buf := make([]byte, 64*1024)
+	for {
+		if _, _, err := conn.ReadFromUDP(buf); err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				return nil
+			}
+			return err
+		}
+	}
 }

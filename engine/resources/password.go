@@ -150,7 +150,7 @@ func (obj *PasswordRes) write(password string) (int, error) {
 		return -1, err
 	}
 
-	c, err := file.Write([]byte(password + newline))
+	c, err := file.WriteString(password + newline)
 	if err != nil {
 		return c, errwrap.Wrapf(err, "can't write file")
 	}
@@ -176,7 +176,7 @@ func (obj *PasswordRes) generate() (string, error) {
 		return "", fmt.Errorf("password is empty")
 	}
 
-	if uint16(len(output)) != obj.Length { // safety against weird bugs
+	if len(output) != int(obj.Length) { // safety against weird bugs
 		return "", fmt.Errorf("password length is too short") // bug!
 	}
 
@@ -185,7 +185,7 @@ func (obj *PasswordRes) generate() (string, error) {
 
 // check validates a stored password string
 func (obj *PasswordRes) check(value string) error {
-	length := uint16(len(value))
+	length := len(value)
 
 	if !obj.Saved && length == 0 { // expecting an empty string
 		return nil
@@ -194,11 +194,11 @@ func (obj *PasswordRes) check(value string) error {
 		return fmt.Errorf("expected empty token only")
 	}
 
-	if length != obj.Length {
+	if length != int(obj.Length) {
 		return fmt.Errorf("string length is not %d", obj.Length)
 	}
 Loop:
-	for i := uint16(0); i < length; i++ {
+	for i := 0; i < length; i++ {
 		for j := 0; j < len(alphabet); j++ {
 			if value[i] == alphabet[j] {
 				continue Loop
@@ -218,7 +218,9 @@ func (obj *PasswordRes) Watch(ctx context.Context) error {
 	}
 	defer recWatcher.Close()
 
-	obj.init.Running() // when started, notify engine that we're running
+	if err := obj.init.Event(ctx); err != nil {
+		return err
+	}
 
 	for {
 		select {
@@ -227,15 +229,21 @@ func (obj *PasswordRes) Watch(ctx context.Context) error {
 			if !ok { // channel shutdown
 				return nil
 			}
+			if event == nil {
+				// programming error
+				return fmt.Errorf("unexpected nil recwatch event")
+			}
 			if err := event.Error; err != nil {
 				return errwrap.Wrapf(err, "unknown %s watcher error", obj)
 			}
 
 		case <-ctx.Done(): // closed by the engine to signal shutdown
-			return nil
+			return ctx.Err()
 		}
 
-		obj.init.Event() // notify engine of an event (this can block)
+		if err := obj.init.Event(ctx); err != nil {
+			return err
+		}
 	}
 }
 

@@ -117,7 +117,7 @@ leaving no residual agent.
 This mode can also be useful for bootstrapping a new host where you'd like to
 have the service run continuously and as part of an mgmt cluster normally.
 
-In particular, when combined with the `--converged-timeout` parameter, the
+In particular, when combined with the `--converger-timeout` parameter, the
 entire set of running mgmt agents will need to all simultaneously converge for
 the group to exit. This is particularly useful for bootstrapping new clusters
 which need to exchange information that is only available at run time.
@@ -130,33 +130,6 @@ execute via a `remote` resource.
 
 You can read the introductory blog post about this topic here:
 [https://purpleidea.com/blog/2016/10/07/remote-execution-in-mgmt/](https://purpleidea.com/blog/2016/10/07/remote-execution-in-mgmt/)
-
-### Puppet support
-
-You can supply a puppet manifest instead of creating the (YAML) graph manually.
-Puppet must be installed and in `mgmt`'s search path. You also need the
-[ffrank-mgmtgraph puppet module](https://forge.puppet.com/ffrank/mgmtgraph).
-
-Invoke `mgmt` with the `--puppet` switch, which supports 3 variants:
-
-1. Request the configuration from the puppet server (like `puppet agent` does)
-
-	`mgmt run puppet --puppet agent`
-
-2. Compile a local manifest file (like `puppet apply`)
-
-	`mgmt run puppet --puppet /path/to/my/manifest.pp`
-
-3. Compile an ad hoc manifest from the commandline (like `puppet apply -e`)
-
-	`mgmt run puppet --puppet 'file { "/etc/ntp.conf": ensure => file }'`
-
-For more details and caveats see [puppet-guide.md](puppet-guide.md).
-
-#### Blog post
-
-An introductory post on the puppet support is on
-[Felix's blog](http://ffrank.github.io/features/2016/06/19/puppet-powered-mgmt/).
 
 ## Reference
 
@@ -217,12 +190,12 @@ resource is replaced with a simple polling mechanism. In general, this is not
 recommended, unless you have a very good reason for doing so.
 
 Please keep in mind that if you have a resource which changes every `I` seconds,
-and you poll it every `J` seconds, and you've asked for a converged timeout of
+and you poll it every `J` seconds, and you've asked for a converger timeout of
 `K` seconds, and `I <= J <= K`, then your graph will likely never converge.
 
 When polling, the system detects that a resource is not converged if its
 `CheckApply` method returns false. This allows a resource which changes every
-`I` seconds, and which is polled every `J` seconds, and with a converged timeout
+`I` seconds, and which is polled every `J` seconds, and with a converger timeout
 of `K` seconds to still converge when `J <= K`, as long as `I > J || I > K`,
 which is another way of saying that if the resource finally settles down to give
 the graph enough time, it can probably converge.
@@ -329,14 +302,14 @@ file "/tmp/foo" {
 	content => "i'm exported!\n",
 
 	Meta:hidden => true,
-	Meta:export => ["h1",],
+	Meta:export => ["h1"],
 }
 
 file "/tmp/foo" {
 	state => "exists",
 	content => "i'm exported AND i'm used here\n",
 
-	Meta:export => ["h1",],
+	Meta:export => ["h1"],
 }
 ```
 
@@ -405,9 +378,13 @@ recommended that you use this, since it's preferable to write code in the
 The main interface to the `mgmt` tool is the command line. For the most recent
 documentation, please run `mgmt --help`.
 
-#### `--converged-timeout <seconds>`
+#### `--converger-timeout <seconds>`
 
-Exit if the machine has converged for approximately this many seconds.
+Consider the machine converged if idle for approximately this many seconds.
+
+#### `--converged-exit`
+
+Exit if the machine has converged as per the `converger-timeout`.
 
 #### `--max-runtime <seconds>`
 
@@ -514,7 +491,7 @@ sudo mkdir -p /etc/systemd/system/mgmt.service.d/
 cat > /etc/systemd/system/mgmt.service.d/env.conf <<EOF
 # Environment variables:
 MGMT_SEEDS=http://127.0.0.1:2379
-MGMT_CONVERGED_TIMEOUT=-1
+MGMT_CONVERGER_TIMEOUT=-1
 MGMT_MAX_RUNTIME=0
 
 # Other CLI options if necessary.

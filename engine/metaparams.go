@@ -42,13 +42,14 @@ import (
 // DefaultMetaParams are the defaults that are used for undefined metaparams.
 // Don't modify this variable. Use .Copy() if you'd like some for yourself.
 var DefaultMetaParams = &MetaParams{
-	Noop:  false,
-	Retry: 0,
-	Delay: 0,
-	Poll:  0,        // defaults to watching for events
-	Limit: rate.Inf, // defaults to no limit
-	Burst: 0,        // no burst needed on an infinite rate
-	Reset: false,
+	Noop:    false,
+	Retry:   0,
+	Delay:   0,
+	Timeout: 0,        // defaults to no CheckApply timeout
+	Poll:    0,        // defaults to watching for events
+	Limit:   rate.Inf, // defaults to no limit
+	Burst:   0,        // no burst needed on an infinite rate
+	Reset:   false,
 	//Sema:  []string{},
 	Rewatch: false,
 	Realize: false, // true would be more awesome, but unexpected for users
@@ -92,8 +93,13 @@ type MetaParams struct {
 	// value is used for both Watch and CheckApply.
 	Delay uint64 `yaml:"delay"`
 
+	// Timeout is the maximum number of milliseconds to allow CheckApply to
+	// run for. Use 0 for no timeout.
+	Timeout uint64 `yaml:"timeout"`
+
 	// Poll is the number of seconds between poll intervals. Use 0 to Watch.
-	Poll uint32 `yaml:"poll"`
+	// Use -1 to only run once.
+	Poll int32 `yaml:"poll"`
 
 	// Limit is the number of events per second to allow through.
 	Limit rate.Limit `yaml:"limit"`
@@ -116,9 +122,9 @@ type MetaParams struct {
 	// also has a count equal to 1, but is a different semaphore.
 	Sema []string `yaml:"sema"`
 
-	// Rewatch specifies whether we re-run the Watch worker during a swap
-	// if it has errored. When doing a GraphCmp to swap the graphs, if this
-	// is true, and this particular worker has errored, then we'll remove it
+	// Rewatch specifies whether we re-run the Watch worker during a swap if
+	// it has errored. When doing a GraphCmp to swap the graphs, if this is
+	// true, and this particular worker has errored, then we'll remove it
 	// and add it back as a new vertex, thus causing it to run again. This
 	// is different from the Retry metaparam which applies during the normal
 	// execution. It is only when this is exhausted that we're in permanent
@@ -191,6 +197,9 @@ func (obj *MetaParams) Cmp(meta *MetaParams) error {
 	}
 	if obj.Delay != meta.Delay {
 		return fmt.Errorf("values for Delay are different")
+	}
+	if obj.Timeout != meta.Timeout {
+		return fmt.Errorf("values for Timeout are different")
 	}
 	if obj.Poll != meta.Poll {
 		return fmt.Errorf("values for Poll are different")
@@ -269,6 +278,7 @@ func (obj *MetaParams) Copy() *MetaParams {
 		Noop:    obj.Noop,
 		Retry:   obj.Retry,
 		Delay:   obj.Delay,
+		Timeout: obj.Timeout,
 		Poll:    obj.Poll,
 		Limit:   obj.Limit, // FIXME: can we copy this type like this? test me!
 		Burst:   obj.Burst,

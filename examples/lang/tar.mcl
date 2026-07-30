@@ -3,7 +3,7 @@ file "/tmp/tar/" {
 	state => "exists",
 }
 
-file ["/tmp/tar/a", "/tmp/tar/bb", "/tmp/tar/cccc",] {
+file ["/tmp/tar/a", "/tmp/tar/bb", "/tmp/tar/cccc"] {
 	state => "exists",
 	content => "some file\n",
 
@@ -34,7 +34,6 @@ file "/tmp/standalone" {
 
 	Before => Tar["/tmp/foo.tar"],
 }
-
 
 tar "/tmp/foo.tar" {
 	inputs => [

@@ -38,6 +38,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -50,6 +51,8 @@ import (
 // would be an interface instead, and different packages would implement it.
 // Since this is not the expectation for the local API, it's all self-contained.
 type API struct {
+	Cancel context.CancelCauseFunc
+
 	Prefix string
 	Debug  bool
 	Logf   func(format string, v ...interface{})
@@ -64,6 +67,20 @@ type API struct {
 	// PoolImpl is the implementation for the Pool API's. The API's are the
 	// collection of public methods that exist on this struct.
 	*PoolImpl
+
+	// CancelImpl is the implementation for the Cancel API. The API is the
+	// collection of public methods that exist on this struct.
+	*CancelImpl
+
+	// HTTPPool is the implementation for the HTTP API's. It is the bridge
+	// that lets http client resources publish their response status and
+	// output file location for http.response functions to consume.
+	*HTTPPool
+
+	// BridgeImpl is the implementation for the Bridge API's. It is a
+	// generic, in-memory, watchable registry that lets resources publish
+	// runtime data for functions to consume.
+	*BridgeImpl
 }
 
 // Init initializes the API before first use. It returns itself so it can be
@@ -88,6 +105,26 @@ func (obj *API) Init() *API {
 		Prefix: obj.Prefix,
 		Debug:  obj.Debug,
 		Logf:   obj.Logf,
+	})
+
+	obj.CancelImpl = &CancelImpl{}
+	obj.CancelImpl.Init(&CancelInit{
+		Cancel: obj.Cancel,
+		//Prefix: obj.Prefix,
+		//Debug:  obj.Debug,
+		//Logf:   obj.Logf,
+	})
+
+	obj.HTTPPool = &HTTPPool{}
+	obj.HTTPPool.Init(&HTTPPoolInit{
+		Debug: obj.Debug,
+		Logf:  obj.Logf,
+	})
+
+	obj.BridgeImpl = &BridgeImpl{}
+	obj.BridgeImpl.Init(&BridgeInit{
+		Debug: obj.Debug,
+		Logf:  obj.Logf,
 	})
 
 	return obj
@@ -261,7 +298,7 @@ func (obj *Value) ValueWatch(ctx context.Context, key string) (chan struct{}, er
 				// recv
 
 			case <-ctx.Done():
-				break // we exit
+				return // we exit
 			}
 
 			select {
@@ -269,7 +306,7 @@ func (obj *Value) ValueWatch(ctx context.Context, key string) (chan struct{}, er
 				// send
 
 			case <-ctx.Done():
-				break // we exit
+				return // we exit
 			}
 		}
 	}()
@@ -297,7 +334,7 @@ func (obj *Value) getPrefix() (string, error) {
 	// already a directory, MkdirAll does nothing and returns nil. (Good!)
 	// TODO: I hope MkdirAll is thread-safe on path creation in case another
 	// future local API tries to make the base (parent) directory too!
-	if err := os.MkdirAll(obj.prefix, 0755); err != nil {
+	if err := os.MkdirAll(obj.prefix, 0750); err != nil {
 		return "", err
 	}
 	obj.prefixExists = true // former race write
@@ -409,7 +446,7 @@ func (obj *VarDirImpl) VarDir(ctx context.Context, reldir string) (string, error
 	// TODO: Should we mkdir this?
 	obj.mutex.Lock()
 	defer obj.mutex.Unlock()
-	if err := os.MkdirAll(result, 0755); err != nil {
+	if err := os.MkdirAll(result, 0750); err != nil {
 		return "", err
 	}
 
@@ -436,7 +473,7 @@ func (obj *VarDirImpl) getPrefix() (string, error) {
 	// already a directory, MkdirAll does nothing and returns nil. (Good!)
 	// TODO: I hope MkdirAll is thread-safe on path creation in case another
 	// future local API tries to make the base (parent) directory too!
-	if err := os.MkdirAll(obj.prefix, 0755); err != nil {
+	if err := os.MkdirAll(obj.prefix, 0750); err != nil {
 		return "", err
 	}
 	obj.prefixExists = true // former race write
@@ -512,7 +549,7 @@ func (obj *PoolImpl) Pool(ctx context.Context, namespace, uid string, config *Po
 
 	obj.mutex.Lock()
 	defer obj.mutex.Unlock()
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0750); err != nil {
 		return 0, err
 	}
 
@@ -595,10 +632,359 @@ func (obj *PoolImpl) getPrefix() (string, error) {
 	// already a directory, MkdirAll does nothing and returns nil. (Good!)
 	// TODO: I hope MkdirAll is thread-safe on path creation in case another
 	// future local API tries to make the base (parent) directory too!
-	if err := os.MkdirAll(obj.prefix, 0755); err != nil {
+	if err := os.MkdirAll(obj.prefix, 0750); err != nil {
 		return "", err
 	}
 	obj.prefixExists = true // former race write
 
 	return obj.prefix, nil
+}
+
+// CancelInit are the init values that the Cancel API needs to work correctly.
+type CancelInit struct {
+	Cancel context.CancelCauseFunc
+	//Prefix string
+	//Debug  bool
+	//Logf   func(format string, v ...interface{})
+}
+
+// CancelImpl is the implementation for the Cancel API. The API is the
+// collection of public methods that exist on this struct.
+type CancelImpl struct {
+	init *CancelInit
+}
+
+// Init runs some initialization code for the Cancel API.
+func (obj *CancelImpl) Init(init *CancelInit) {
+	obj.init = init
+}
+
+// Exit causes a shutdown. Returns an error if something went wrong.
+func (obj *CancelImpl) Exit(code int) error {
+	// XXX: Do we need a mutex?
+	//obj.mutex.Lock()
+	//defer obj.mutex.Unlock()
+
+	if code == 0 {
+		obj.init.Cancel(nil)
+		return nil
+	}
+
+	err := util.ExitCodeError{Code: code} // magic error!
+	obj.init.Cancel(err)
+	return nil
+}
+
+// HTTPPoolInit are the init values that the HTTP API needs to work correctly.
+type HTTPPoolInit struct {
+	Debug bool
+	Logf  func(format string, v ...interface{})
+}
+
+// HTTPResponse is the response state that an http client resource publishes for
+// a given uid, so that a corresponding http.response function can read it back.
+type HTTPResponse struct {
+	// Status is the most recent HTTP status code (eg: 200) for the named
+	// resource. It is zero if nothing is known yet, and -1 if an
+	// engine-level error happened (eg: a transport, disk, or validation
+	// failure) rather than getting an HTTP status code.
+	Status int
+
+	// Path is the absolute path to the file holding the downloaded body. It
+	// is empty if no valid body is currently available.
+	Path string
+}
+
+// HTTPPool is the implementation for the HTTP API's. It is an in-memory,
+// watchable registry that bridges http client resources (which publish their
+// response status and output file locations) and http.response functions (which
+// read and watch that data). It is intentionally not backed by disk, since the
+// response state is only meaningful while the engine is running. The function
+// engine starts before resources do, so an unknown uid simply reads back as the
+// zero value, which is exactly the desired "nothing has happened yet" state.
+type HTTPPool struct {
+	init   *HTTPPoolInit
+	mutex  *sync.Mutex
+	values map[string]*HTTPResponse
+	notify map[chan struct{}]string // one chan (unique ptr) for each watch
+}
+
+// Init runs some initialization code for the HTTP API.
+func (obj *HTTPPool) Init(init *HTTPPoolInit) {
+	obj.init = init
+	obj.mutex = &sync.Mutex{}
+	obj.values = make(map[string]*HTTPResponse)
+	obj.notify = make(map[chan struct{}]string)
+}
+
+// HTTPSet publishes the response state for a given uid and notifies any
+// watchers if it changed. It is called by the http:client resource. Passing the
+// same values as already stored is a no-op that does not notify.
+func (obj *HTTPPool) HTTPSet(ctx context.Context, uid string, status int, path string) error {
+	if uid == "" {
+		return fmt.Errorf("uid is empty")
+	}
+
+	obj.mutex.Lock()
+	defer obj.mutex.Unlock()
+
+	// If we're already in the correct state, then return early and *don't*
+	// send any events at the very end...
+	if v, exists := obj.values[uid]; exists && v.Status == status && v.Path == path {
+		return nil // already in the correct state
+	}
+	obj.values[uid] = &HTTPResponse{
+		Status: status,
+		Path:   path,
+	}
+
+	for ch, k := range obj.notify { // send notifications to any watchers...
+		if k != uid { // there might be more than one watcher per uid
+			continue
+		}
+		select {
+		case ch <- struct{}{}: // must be async and not block forever
+			// send
+
+		default:
+			// The notify chan is buffered (1) so if it's full then
+			// a notification is already pending and dropping this
+			// one coalesces them, which is exactly what we want.
+		}
+	}
+
+	return nil
+}
+
+// HTTPGet reads the response state for a given uid. If nothing has been
+// published yet, it returns an empty (zero-value) response and no error, since
+// a zero status is exactly the "nothing has happened yet" state that consumers
+// want to see. The returned value is a copy that is safe for the caller to use
+// without holding our lock.
+func (obj *HTTPPool) HTTPGet(ctx context.Context, uid string) (*HTTPResponse, error) {
+	obj.mutex.Lock()
+	defer obj.mutex.Unlock()
+
+	resp, exists := obj.values[uid]
+	if !exists { // nothing published yet
+		return &HTTPResponse{ // empty
+			Status: 0,
+			Path:   "",
+		}, nil
+	}
+	return &HTTPResponse{ // return a copy
+		Status: resp.Status,
+		Path:   resp.Path,
+	}, nil
+}
+
+// HTTPWatch watches the response state for a given uid. Like ValueWatch, it
+// sends a single startup event and then one event for each subsequent change.
+func (obj *HTTPPool) HTTPWatch(ctx context.Context, uid string) (chan struct{}, error) {
+	obj.mutex.Lock()
+	defer obj.mutex.Unlock()
+
+	notifyCh := make(chan struct{}, 1) // so we can async send
+	obj.notify[notifyCh] = uid         // add (while within the mutex)
+	notifyCh <- struct{}{}             // startup signal, send one!
+	ch := make(chan struct{})
+	go func() {
+		defer func() { // cleanup
+			obj.mutex.Lock()
+			defer obj.mutex.Unlock()
+			delete(obj.notify, notifyCh) // free memory (in mutex)
+		}()
+		for {
+			select {
+			case _, ok := <-notifyCh:
+				if !ok {
+					// programming error
+					panic("unexpected channel closure")
+				}
+				// recv
+
+			case <-ctx.Done():
+				return // we exit
+			}
+
+			select {
+			case ch <- struct{}{}:
+				// send
+
+			case <-ctx.Done():
+				return // we exit
+			}
+		}
+	}()
+
+	return ch, nil
+}
+
+// BridgeInit are the init values that the Bridge API needs to work correctly.
+type BridgeInit struct {
+	Debug bool
+	Logf  func(format string, v ...interface{})
+}
+
+// BridgeImpl is the implementation for the Bridge API's. The API's are the
+// collection of public methods that exist on this struct. It is a generic,
+// in-memory, watchable registry that bridges resources (which publish runtime
+// data such as credentials or connection parameters) and functions (which read
+// and watch that data). It is intentionally not backed by disk, both because
+// the data is only meaningful while the publishing resource is running, and
+// because it may contain secrets which should never be persisted. The function
+// engine starts before resources do, so an unknown entry simply reads back as
+// nil, which is the "nothing has been published yet" state that consumers
+// should turn into their zero value.
+//
+// Since the uid within a namespace is commonly the user-controlled name of the
+// publishing resource, every consumer of this API must pass in its own unique
+// namespace to avoid collisions between different users of this bridge. The
+// namespace is typically the resource kind that publishes into it, for example:
+// "foo:endpoint". The namespace and uid are combined internally, and are never
+// mixed up between different namespaces.
+type BridgeImpl struct {
+	init   *BridgeInit
+	mutex  *sync.Mutex
+	values map[string]interface{}
+	notify map[chan struct{}]string // one chan (unique ptr) for each watch
+}
+
+// Init runs some initialization code for the Bridge API.
+func (obj *BridgeImpl) Init(init *BridgeInit) {
+	obj.init = init
+	obj.mutex = &sync.Mutex{}
+	obj.values = make(map[string]interface{})
+	obj.notify = make(map[chan struct{}]string)
+}
+
+// BridgeSet publishes a value under a namespace and uid, and notifies any
+// watchers if it changed. Passing a nil value unpublishes the entry, which also
+// notifies. Setting the same value as already stored (as compared with
+// reflect.DeepEqual) is a no-op that does not notify. Callers must treat a
+// published value as immutable, and set a new one instead of modifying it.
+func (obj *BridgeImpl) BridgeSet(ctx context.Context, namespace, uid string, value interface{}) error {
+	key, err := bridgeKey(namespace, uid)
+	if err != nil {
+		return err
+	}
+
+	obj.mutex.Lock()
+	defer obj.mutex.Unlock()
+
+	// If we're already in the correct state, then return early and *don't*
+	// send any events at the very end...
+	v, exists := obj.values[key]
+	if !exists && value == nil {
+		return nil // already in the correct state
+	}
+	if exists && reflect.DeepEqual(v, value) {
+		return nil // already in the correct state
+	}
+
+	if value == nil { // remove/delete
+		delete(obj.values, key)
+	} else {
+		obj.values[key] = value // store to in-memory map
+	}
+
+	// We still notify on remove/delete!
+	for ch, k := range obj.notify { // send notifications to any watchers...
+		if k != key { // there might be more than one watcher per key
+			continue
+		}
+		select {
+		case ch <- struct{}{}: // must be async and not block forever
+			// send
+
+		default:
+			// The notify chan is buffered (1) so if it's full then
+			// a notification is already pending and dropping this
+			// one coalesces them, which is exactly what we want.
+		}
+	}
+
+	return nil
+}
+
+// BridgeGet reads the value stored under a namespace and uid. If nothing has
+// been published yet, it returns nil and no error, since that is exactly the
+// "nothing has happened yet" state that consumers want to see. The caller must
+// treat the returned value as read-only, since it is shared with the publisher
+// and any other readers.
+func (obj *BridgeImpl) BridgeGet(ctx context.Context, namespace, uid string) (interface{}, error) {
+	key, err := bridgeKey(namespace, uid)
+	if err != nil {
+		return nil, err
+	}
+
+	obj.mutex.Lock()
+	defer obj.mutex.Unlock()
+
+	return obj.values[key], nil // nil if it doesn't exist
+}
+
+// BridgeWatch watches the value stored under a namespace and uid. Like
+// ValueWatch, it sends a single startup event, and then one event for each
+// subsequent change, including unpublishing.
+func (obj *BridgeImpl) BridgeWatch(ctx context.Context, namespace, uid string) (chan struct{}, error) {
+	key, err := bridgeKey(namespace, uid)
+	if err != nil {
+		return nil, err
+	}
+
+	obj.mutex.Lock()
+	defer obj.mutex.Unlock()
+
+	notifyCh := make(chan struct{}, 1) // so we can async send
+	obj.notify[notifyCh] = key         // add (while within the mutex)
+	notifyCh <- struct{}{}             // startup signal, send one!
+	ch := make(chan struct{})
+	go func() {
+		defer func() { // cleanup
+			obj.mutex.Lock()
+			defer obj.mutex.Unlock()
+			delete(obj.notify, notifyCh) // free memory (in mutex)
+		}()
+		for {
+			select {
+			case _, ok := <-notifyCh:
+				if !ok {
+					// programming error
+					panic("unexpected channel closure")
+				}
+				// recv
+
+			case <-ctx.Done():
+				return // we exit
+			}
+
+			select {
+			case ch <- struct{}{}:
+				// send
+
+			case <-ctx.Done():
+				return // we exit
+			}
+		}
+	}()
+
+	return ch, nil
+}
+
+// bridgeKey builds the internal key from a namespace and uid, and validates
+// both. The separator can't appear in the namespace, so two different
+// namespaces can never collide, even with malicious uid values.
+func bridgeKey(namespace, uid string) (string, error) {
+	if namespace == "" {
+		return "", fmt.Errorf("namespace is empty")
+	}
+	if strings.Contains(namespace, "/") {
+		return "", fmt.Errorf("namespace contains slash")
+	}
+	if uid == "" {
+		return "", fmt.Errorf("uid is empty")
+	}
+
+	return namespace + "/" + uid, nil
 }

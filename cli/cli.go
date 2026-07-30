@@ -50,7 +50,14 @@ func init() {
 }
 
 // CLI is the entry point for using mgmt normally from the CLI.
-func CLI(ctx context.Context, data *cliUtil.Data) error {
+func CLI(ctx context.Context, data *cliUtil.Data) (reterr error) {
+	// Log any error we're about to return so that we don't fail silently.
+	// Without this, the top-level main would only set the exit code.
+	defer func() {
+		if reterr != nil && data != nil && data.Flags.Logf != nil {
+			data.Flags.Logf("error: %v", reterr)
+		}
+	}()
 	// test for sanity
 	if data == nil {
 		return fmt.Errorf("this CLI was not run correctly")
@@ -74,7 +81,7 @@ func CLI(ctx context.Context, data *cliUtil.Data) error {
 		// programming error
 		return errwrap.Wrapf(err, "cli config error")
 	}
-	err = parser.Parse(data.Args[1:]) // XXX: args[0] needs to be dropped
+	err = parser.Parse(NormalizeArgs(data.Args[1:])) // XXX: args[0] needs to be dropped
 	if err == arg.ErrHelp {
 		parser.WriteHelp(os.Stdout)
 		return nil
@@ -115,6 +122,10 @@ type Args struct {
 
 	License bool `arg:"--license" help:"display the license and exit"`
 
+	HelpCmd *HelpArgs `arg:"subcommand:help" help:"display this help and exit"`
+
+	CheckCmd *CheckArgs `arg:"subcommand:check" help:"check code on this machine"`
+
 	RunCmd *RunArgs `arg:"subcommand:run" help:"run code on this machine"`
 
 	DeployCmd *DeployArgs `arg:"subcommand:deploy" help:"deploy code into a cluster"`
@@ -128,7 +139,8 @@ type Args struct {
 	ToolsCmd *ToolsArgs `arg:"subcommand:tools" help:"collection of useful tools"`
 
 	// This never runs, it gets preempted in the real main() function.
-	// XXX: Can we do it nicely with the new arg parser? can it ignore all args?
+	// XXX: Can we do it nicely with the new arg parser? can it ignore all
+	// args?
 	EtcdCmd *EtcdArgs `arg:"subcommand:etcd" help:"run standalone etcd"`
 
 	// This never runs, it gets preempted in the real main() function.
@@ -158,6 +170,14 @@ func (obj *Args) Description() string {
 // we did not. This information is used so that the top-level parser can return
 // usage or help information if no subcommand activates.
 func (obj *Args) Run(ctx context.Context, data *cliUtil.Data) (bool, error) {
+	if cmd := obj.HelpCmd; cmd != nil {
+		return cmd.Run(ctx, data)
+	}
+
+	if cmd := obj.CheckCmd; cmd != nil {
+		return cmd.Run(ctx, data)
+	}
+
 	if cmd := obj.RunCmd; cmd != nil {
 		return cmd.Run(ctx, data)
 	}

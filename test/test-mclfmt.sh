@@ -15,7 +15,7 @@ cd "${ROOT}"
 #F="misc/TODO.mcl"	# TODO: you can add single files like this...
 find_files() {
 	# TODO: improve this match if we use txtar for non-mcl things eventually
-	git ls-files | grep -e '\.mcl$' -e '\.txtar$' | grep -v 'misc/TODO.mcl'
+	repo_files | grep -e '\.mcl$' -e '\.txtar$' | grep -v 'misc/TODO.mcl'
 }
 
 bad_files=$(
@@ -24,7 +24,9 @@ bad_files=$(
 	#fi
 	for i in $(find_files); do
 		# search for at least one leading space, to ensure we use tabs
-		if grep -q '^ ' "$i"; then
+		# if following the leading spaces we have a caret, then skip...
+		# (the caret scenario is to exclude txtar tests with a textarea)
+		if grep -q -E '^ +[^ ^]' "$i"; then
 			echo "$i"
 		fi
 	done
